@@ -284,6 +284,31 @@ async function requestDashboardFromPage(dashboardId) {
   return result;
 }
 
+// Deterministic JSON with object keys sorted, so two structurally-equal
+// dashboards stringify identically regardless of key insertion order.
+function stableStringify(value) {
+  if (Array.isArray(value)) {
+    return '[' + value.map(stableStringify).join(',') + ']';
+  }
+  if (value && typeof value === 'object') {
+    const keys = Object.keys(value).sort();
+    return '{' + keys.map((k) => JSON.stringify(k) + ':' + stableStringify(value[k])).join(',') + '}';
+  }
+  return JSON.stringify(value);
+}
+
+// The page content script's "did the apply dialog close" heuristic can return a
+// false negative even when the edit actually committed. When that happens we ask
+// the page for its current JSON and compare it to the working copy we pushed.
+// Because every apply carries a unique change, the live state can only match the
+// working copy if the edit truly landed, so this can overturn a false negative
+// but never invent a false success. Returns true when verified applied.
+async function verifyAppliedAgainstPage(dashboardId, workingDash) {
+  const page = await requestDashboardFromPage(dashboardId);
+  if (!page || page.timeout || page.error || !page.dashboard) return false;
+  return stableStringify(page.dashboard) === stableStringify(workingDash);
+}
+
 // Route handlers
 async function handleStatus(req, res) {
   sendJson(res, {
@@ -812,6 +837,25 @@ async function handleApply(req, res, dashboardId) {
     }, 504);
   }
   if (result.success === false) {
+    // The page reported failure, but its dialog-close detection is known to
+    // false-negative. Verify against live state before trusting that.
+    const verified = await verifyAppliedAgainstPage(dashboardId, dash);
+    if (verified) {
+      log(`Apply reported failure but live state matches working copy; treating as applied (dashboard ${dashboardId})`);
+      try {
+        store.promoteWorkingToSaved(dashboardId);
+      } catch (e) {
+        return sendJson(res, { error: e.message, code: 'store_write_failed' }, 500);
+      }
+      return sendJson(res, {
+        ok: true,
+        result: {
+          success: true,
+          verified: true,
+          note: 'Page reported a dialog-close failure, but the live dashboard matches the applied edit, so the change committed.'
+        }
+      });
+    }
     return sendJson(res, { ok: false, result }, 200);
   }
 

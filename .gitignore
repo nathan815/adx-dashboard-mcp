@@ -1,0 +1,8 @@
+node_modules/
+*.log
+.DS_Store
+
+# Local daemon state and caches live under the cache root
+# (process.env.ADX_LIVE_EDIT_HOME || ~/.adx-live-edit-mcp), never in the repo.
+.adx-live-edit-mcp/
+.cache/

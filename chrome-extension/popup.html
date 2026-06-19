@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>
+    body {
+      width: 320px;
+      padding: 16px;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      font-size: 14px;
+    }
+    h1 {
+      font-size: 18px;
+      margin: 0 0 12px 0;
+      color: #0078d4;
+    }
+    .status {
+      padding: 8px 12px;
+      border-radius: 4px;
+      margin-bottom: 12px;
+    }
+    .status.connected { background: #dff6dd; color: #107c10; }
+    .status.disconnected { background: #fed9cc; color: #a4262c; }
+    button {
+      width: 100%;
+      padding: 10px;
+      margin: 4px 0;
+      border: none;
+      border-radius: 4px;
+      background: #0078d4;
+      color: white;
+      cursor: pointer;
+      font-size: 14px;
+    }
+    button:hover { background: #106ebe; }
+    button:disabled { background: #ccc; cursor: not-allowed; }
+    .output {
+      margin-top: 12px;
+      padding: 8px;
+      background: #f3f3f3;
+      border-radius: 4px;
+      font-family: monospace;
+      font-size: 12px;
+      max-height: 200px;
+      overflow: auto;
+      white-space: pre-wrap;
+      word-break: break-all;
+    }
+    .info {
+      font-size: 12px;
+      color: #666;
+      margin-top: 12px;
+    }
+  </style>
+</head>
+<body>
+  <h1>🔧 ADX Dashboard Agent</h1>
+  <div id="status" class="status disconnected">Checking...</div>
+  
+  <button id="getDashboard">Get Dashboard JSON</button>
+  <button id="copyJson" disabled>Copy to Clipboard</button>
+  
+  <div id="output" class="output" style="display:none"></div>
+  
+  <div class="info">
+    <strong>API:</strong> <code>window.__adxAgent</code><br>
+    <strong>Methods:</strong> getDashboard(), replaceDashboard(json)
+  </div>
+  
+  <script src="popup.js"></script>
+</body>
+</html>

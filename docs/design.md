@@ -257,3 +257,34 @@ config block, extension releases). Registration is one stdio config block:
 3. Typed tools with schema-derived input shapes; `usedVariables` enforcement in `set_query`.
 4. Shared validation logic; repo plus distribution wiring.
 5. Retire/slim the old SKILL.md to a pointer; keep the authoring skill.
+
+## v1 implementation notes
+
+The full tool surface above is implemented and committed. A few things ship slightly
+differently from the design intent stated earlier in this document. They are recorded here so
+the doc matches what actually runs:
+
+- **No `pull` tool.** The design says the daemon pulls a working copy on first access. The
+  daemon returns `409 no_working_copy` instead, so the read tools wrap a `withAutoPull` helper
+  that catches that 409, calls the daemon `pull` endpoint once, and retries. The net behavior
+  matches "pulls on first access"; there is just no agent-visible `pull`.
+- **`list_dashboards` returns connected tabs, not a management-API catalog.** It lists the
+  dashboards that currently have a live browser tab connected to the daemon, not every dashboard
+  the user could open. Listing dashboards without an open tab is a possible later addition.
+- **`get_schema` has no dashboard context.** It takes an optional `file` (omit for the whole
+  schema graph) and a `version` that defaults to 76, rather than defaulting to a specific
+  dashboard's `schema_version`. All current dashboards are v76, so this is equivalent in
+  practice.
+- **Typed input shapes use curated static v76 enums**, not shapes derived from a live schema
+  fetch. Deriving them at tool-registration time would trigger the ~20 second daemon cold start
+  during `tools/list` and break instant listing. The daemon still ajv-validates every write
+  against the cached schema, which is the real gate.
+- **`set_tile` accepts `markdownText`** (markdown tiles need a way to set their text) even though
+  the field list earlier in this doc omitted it.
+- **`set_parameter` takes a flat `patch` object**, not a per-kind typed shape. The daemon
+  ajv-validates the merged parameter against `parameter.json`. Per-kind typed parameter editing
+  is a candidate refinement.
+- **`usedVariables` accept/reject is covered by unit tests, not a headless stdio round-trip.**
+  The patch endpoints need a working copy pulled from a live browser tab, so without a connected
+  tab `set_query` fails at the pull step before the `usedVariables` check runs. The accept/reject
+  logic is exercised directly by the patch unit tests.

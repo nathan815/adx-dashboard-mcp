@@ -57,7 +57,17 @@ npm run daemon     # run the daemon directly (normally auto-started)
 npm test           # run the unit tests
 ```
 
-## Status
+## Tools
 
-Early development. The tool surface is being built out in phases per
-[docs/design.md](docs/design.md).
+The full v1 surface is implemented: 22 tools (8 read, 10 write, 4 lifecycle).
+
+- **Read**: `list_dashboards`, `get_dashboard_summary`, `list_pages`, `list_tiles`,
+  `get_tile`, `get_query`, `get_parameters`, `get_schema`.
+- **Write**: `set_query`, `set_query_datasource`, `set_tile`, `set_layout`, `add_tile`,
+  `remove_tile`, `set_parameter`, `add_parameter`, `remove_parameter`, `rename_page`.
+- **Lifecycle**: `apply`, `get_errors`, `discard`, `refresh`.
+
+Writes mutate a daemon-held working copy and are schema-validated before they return.
+`apply` pushes the working copy to the browser and blocks on your approval. See
+[docs/design.md](docs/design.md) for the data model the tools hide and the
+`usedVariables` rule, plus the v1 implementation notes at the end.

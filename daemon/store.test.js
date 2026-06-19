@@ -9,7 +9,7 @@ import path from 'node:path';
 const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'adx-store-'));
 process.env.ADX_LIVE_EDIT_HOME = tmpHome;
 
-const store = await import('../daemon/store.js');
+const store = await import('./store.js');
 
 const DASH_ID = '12345678-1234-4123-8123-123456789abc';
 

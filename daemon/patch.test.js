@@ -10,12 +10,12 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 process.env.ADX_LIVE_EDIT_HOME = path.resolve(here, '..', '.cache');
 
 const { validateDashboard } = await import('../shared/validate.js');
-const patch = await import('../daemon/patch.js');
+const patch = await import('./patch.js');
 
 const FIXTURE_PATH = path.join(here, 'fixtures', 'dashboard.json');
 const RAW = fs.readFileSync(FIXTURE_PATH, 'utf8');
 
-// Ids baked into test/fixtures/dashboard.json.
+// Ids baked into daemon/fixtures/dashboard.json.
 const ID = {
   pageMain: '11111111-1111-4111-8111-111111111111',
   pageSecond: '22222222-2222-4222-8222-222222222222',

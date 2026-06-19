@@ -835,19 +835,21 @@ async function handleDiscard(req, res, dashboardId) {
   sendJson(res, { ok: true, result: patch.dashboardSummary(store.loadWorking(dashboardId)) });
 }
 
-// Serve a single schema file from the daemon-owned cache. GET /schema?file=tile.json&version=76
+// Serve schema from the daemon-owned cache. With ?file=tile.json returns that one
+// file's raw text; with no file, returns the whole { filename: schema } graph.
 async function handleSchema(req, res) {
   const url = new URL(req.url, `http://localhost:${PORT}`);
   const file = url.searchParams.get('file');
   const version = url.searchParams.get('version') || String(DEFAULT_SCHEMA_VERSION);
-  if (!file) {
-    return sendJson(res, {
-      error: 'Missing file query parameter',
-      code: 'invalid_input',
-      hint: 'Pass ?file=dashboard.json (and optional &version=76).'
-    }, 400);
-  }
   try {
+    if (!file) {
+      const graph = await store.readSchemaGraph(version);
+      res.writeHead(200, {
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*'
+      });
+      return res.end(JSON.stringify(graph));
+    }
     const text = await store.readSchemaFile(version, file);
     res.writeHead(200, {
       'Content-Type': 'application/json',

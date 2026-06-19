@@ -110,9 +110,9 @@ export function registerReadTools(server) {
     {
       title: 'Get schema',
       description:
-        'Fetch one cached ADX dashboard schema file (e.g. "tile.json", "query.json", "parameter.json", "dashboard.json") so you can pull just the part you need instead of the whole graph. Defaults to schema version 76.',
+        'Fetch the cached ADX dashboard schema. Pass file (e.g. "tile.json", "query.json", "parameter.json", "dashboard.json") to get just that file, or omit file to get the whole { filename: schema } graph. Defaults to schema version 76.',
       inputSchema: {
-        file: z.string().describe('Schema file name, e.g. "tile.json".'),
+        file: z.string().optional().describe('Schema file name, e.g. "tile.json". Omit to get the whole graph.'),
         schemaVersion: z.number().int().optional().describe('Schema version. Defaults to 76.'),
       },
     },

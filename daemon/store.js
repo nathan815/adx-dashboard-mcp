@@ -109,4 +109,11 @@ export async function ensureSchemaCached(version) {
   await loadSchemaGraph(version);
 }
 
+// Serve the entire schema graph as a { filename: schemaObject } map. Backs the
+// file-less get_schema call so the agent can pull every file in one read.
+export async function readSchemaGraph(version) {
+  const graph = await loadSchemaGraph(version);
+  return Object.fromEntries(graph);
+}
+
 export const _internal = { dashboardDir, savedPath, workingPath, dirNameFor };

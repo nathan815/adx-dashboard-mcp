@@ -2,6 +2,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { registerReadTools } from "./tools/read.js";
+import { registerWriteTools } from "./tools/write.js";
 import { registerLifecycleTools } from "./tools/lifecycle.js";
 
 const server = new McpServer({
@@ -11,8 +12,9 @@ const server = new McpServer({
 
 // Tools touch the daemon lazily (first call triggers ensureDaemon), so
 // registration here stays instant and tool-listing never pays the ~20s cold
-// start. Typed write tools land in Phase 4.
+// start.
 registerReadTools(server);
+registerWriteTools(server);
 registerLifecycleTools(server);
 
 async function main() {

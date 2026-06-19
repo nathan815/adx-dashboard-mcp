@@ -179,9 +179,11 @@ export const daemon = {
   status: () => call('GET', '/status', undefined, { timeoutMs: 2000, context: 'Status' }),
   listDashboards: () => call('GET', '/dashboards', undefined, { timeoutMs: 5000, context: 'List dashboards' }),
   getSchema: (file, version) => {
-    const q = new URLSearchParams({ file });
+    const q = new URLSearchParams();
+    if (file) q.set('file', file);
     if (version) q.set('version', String(version));
-    return call('GET', `/schema?${q.toString()}`, undefined, { context: 'Get schema' });
+    const qs = q.toString();
+    return call('GET', qs ? `/schema?${qs}` : '/schema', undefined, { context: 'Get schema' });
   },
 
   // Lifecycle.

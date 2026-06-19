@@ -1,24 +1,19 @@
 #!/usr/bin/env node
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { registerReadTools } from "./tools/read.js";
+import { registerLifecycleTools } from "./tools/lifecycle.js";
 
 const server = new McpServer({
   name: "adx-live-edit-mcp",
   version: "0.1.0",
 });
 
-// Phase 0 scaffold tool. Real read/write/lifecycle tools land in later phases.
-server.registerTool(
-  "ping",
-  {
-    title: "Ping",
-    description: "Health check for the adx-live-edit MCP server scaffold.",
-    inputSchema: {},
-  },
-  async () => ({
-    content: [{ type: "text", text: "adx-live-edit-mcp scaffold is alive" }],
-  })
-);
+// Tools touch the daemon lazily (first call triggers ensureDaemon), so
+// registration here stays instant and tool-listing never pays the ~20s cold
+// start. Typed write tools land in Phase 4.
+registerReadTools(server);
+registerLifecycleTools(server);
 
 async function main() {
   const transport = new StdioServerTransport();

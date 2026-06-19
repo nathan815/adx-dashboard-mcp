@@ -167,7 +167,7 @@ function parseBody(req) {
 
 // Register or refresh one browser tab for a dashboard. Returns true when this is the
 // first time we have seen the instance.
-function touchInstance(dashboardId, instanceId, title) {
+function touchInstance(dashboardId, instanceId, title, agentVersion) {
   if (!dashboardId || !instanceId) return false;
   let instances = connectedDashboards.get(dashboardId);
   if (!instances) {
@@ -178,6 +178,7 @@ function touchInstance(dashboardId, instanceId, title) {
   instances.set(instanceId, {
     instanceId,
     title: title || (prev && prev.title) || 'Untitled',
+    agentVersion: agentVersion || (prev && prev.agentVersion) || null,
     connectedAt: prev ? prev.connectedAt : Date.now()
   });
   return !prev;
@@ -458,9 +459,9 @@ async function handleConnect(req, res) {
 
   // Default instanceId to dashboardId so the legacy extension (no per-tab id) still works.
   const instanceId = data.instanceId || dashboardId;
-  const isNew = touchInstance(dashboardId, instanceId, title);
+  const isNew = touchInstance(dashboardId, instanceId, title, data.agentVersion);
   if (isNew) {
-    log(`Extension connected: ${dashboardId} "${title || 'Untitled'}" (instance ${instanceId})`);
+    log(`Extension connected: ${dashboardId} "${title || 'Untitled'}" (instance ${instanceId}, agent ${data.agentVersion || 'unknown'})`);
   }
 
   sendJson(res, { ok: true });
@@ -493,7 +494,8 @@ async function handleDashboards(req, res) {
       id: dashboardId,
       title: first.title || 'Untitled',
       connectedAt: first.connectedAt || null,
-      instanceCount: list.length
+      instanceCount: list.length,
+      agentVersion: first.agentVersion || null
     });
   }
   sendJson(res, { dashboards });

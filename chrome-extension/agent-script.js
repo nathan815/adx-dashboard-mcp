@@ -145,7 +145,7 @@
   }
 
   window.__adxAgent = {
-    version: '1.0.0',
+    version: '1.1.0',
     authorizedDashboards,
 
     getDashboard: function() {
@@ -335,25 +335,52 @@
               }
 
               const clickedBtn = outcome.continueBtn;
+              // Capture the dialog container before clicking. ADX may close its
+              // confirm dialog either by detaching the button or by tearing down
+              // the whole dialog surface, and the page also has an unrelated,
+              // always-present control whose text is "Continue". Watching the
+              // dialog container (not just any "Continue" button) is what keeps
+              // us from wrongly reporting failure when the edit actually applied.
+              const dialogEl = clickedBtn.closest(
+                '[role="dialog"], .ms-Dialog, .fui-DialogSurface, [class*="Dialog"], [class*="dialog"]'
+              );
               clickedBtn.click();
 
-              // Track the exact button node we clicked rather than re-running
-              // findConfirmButton(). ADX closes its confirm dialog by detaching
-              // (or hiding) that button, but the page can also have an unrelated,
-              // always-present control whose text is "Continue". Re-scanning for
-              // any "Continue" button matched that persistent control and made us
-              // wrongly report "dialog did not close" even though the edit had
-              // already committed to the live dashboard.
               const settled = await waitFor(() => {
                 const lateError = extractValidationErrors();
                 if (lateError) return { kind: 'error', lateError };
-                const gone = !document.contains(clickedBtn) || clickedBtn.offsetParent === null;
-                if (gone) return { kind: 'applied' };
+                const btnGone = !document.contains(clickedBtn) || clickedBtn.offsetParent === null;
+                const dialogGone = dialogEl
+                  ? (!document.contains(dialogEl) || dialogEl.offsetParent === null)
+                  : false;
+                // The real confirm button leaving the dialog (even if a persistent
+                // "Continue" control survives elsewhere) means the dialog closed.
+                const cur = findConfirmButton();
+                const confirmGoneFromDialog = dialogEl ? (!cur || !dialogEl.contains(cur)) : !cur;
+                if (btnGone || dialogGone || confirmGoneFromDialog) return { kind: 'applied' };
                 return null;
               }, { timeout: APPLY_WAIT_MS });
 
               if (!settled) {
-                fail(new Error('Clicked Continue but the confirmation dialog did not close; the edit may not have applied'));
+                // Surface the live DOM facts so the failure is diagnosable instead
+                // of a bare guess, and include the script version so we can tell
+                // whether the loaded content script is current.
+                const cur = findConfirmButton();
+                const diag = {
+                  agentVersion: window.__adxAgent.version,
+                  clickedBtnInDoc: document.contains(clickedBtn),
+                  clickedBtnVisible: clickedBtn.offsetParent !== null,
+                  clickedBtnText: (clickedBtn.textContent || '').trim().slice(0, 40),
+                  dialogElFound: !!dialogEl,
+                  dialogElInDoc: dialogEl ? document.contains(dialogEl) : null,
+                  dialogElVisible: dialogEl ? dialogEl.offsetParent !== null : null,
+                  roleDialogCount: document.querySelectorAll('[role="dialog"]').length,
+                  confirmButtonNow: cur ? (cur.textContent || '').trim().slice(0, 40) : null
+                };
+                fail(new Error(
+                  'Clicked Continue but could not confirm the dialog closed. DOM diagnostic: ' +
+                  JSON.stringify(diag)
+                ));
                 return;
               }
               if (settled.kind === 'error') {
@@ -655,7 +682,7 @@
       await fetch(`http://localhost:${AGENT_SERVER_PORT}/connect`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ dashboardId, title: dashData.title, instanceId: INSTANCE_ID })
+        body: JSON.stringify({ dashboardId, title: dashData.title, instanceId: INSTANCE_ID, agentVersion: window.__adxAgent.version })
       });
       return true;
     } catch (e) {

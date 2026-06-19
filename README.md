@@ -18,7 +18,7 @@ See [docs/design.md](docs/design.md) for the full architecture and tool surface.
 - **daemon** (`daemon/agent-server.js`) - a single persistent process on `127.0.0.1:9876`
   that owns the browser connection, the per-dashboard approval grant, the schema cache, and
   the saved/working copy of each dashboard.
-- **MCP server** (`src/index.js`) - the thin stdio front end. One per agent session. Maps
+- **MCP server** (`mcp-server/index.js`) - the thin stdio front end. One per agent session. Maps
   typed tool calls to daemon HTTP endpoints and auto-starts the daemon when needed.
 
 ## Setup

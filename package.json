@@ -7,10 +7,10 @@
     "node": ">=18"
   },
   "bin": {
-    "adx-live-edit-mcp": "src/index.js"
+    "adx-live-edit-mcp": "mcp-server/index.js"
   },
   "files": [
-    "src",
+    "mcp-server",
     "daemon",
     "shared",
     "chrome-extension",
@@ -18,7 +18,7 @@
     "README.md"
   ],
   "scripts": {
-    "start": "node src/index.js",
+    "start": "node mcp-server/index.js",
     "daemon": "node daemon/agent-server.js",
     "test": "node --test"
   },

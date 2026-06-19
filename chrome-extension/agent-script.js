@@ -334,14 +334,21 @@
                 return;
               }
 
-              outcome.continueBtn.click();
+              const clickedBtn = outcome.continueBtn;
+              clickedBtn.click();
 
-              // Confirm the dialog actually closed (edit applied) and surface a
-              // late validation error if ADX rejects it after confirming.
+              // Track the exact button node we clicked rather than re-running
+              // findConfirmButton(). ADX closes its confirm dialog by detaching
+              // (or hiding) that button, but the page can also have an unrelated,
+              // always-present control whose text is "Continue". Re-scanning for
+              // any "Continue" button matched that persistent control and made us
+              // wrongly report "dialog did not close" even though the edit had
+              // already committed to the live dashboard.
               const settled = await waitFor(() => {
                 const lateError = extractValidationErrors();
                 if (lateError) return { kind: 'error', lateError };
-                if (!findConfirmButton()) return { kind: 'applied' };
+                const gone = !document.contains(clickedBtn) || clickedBtn.offsetParent === null;
+                if (gone) return { kind: 'applied' };
                 return null;
               }, { timeout: APPLY_WAIT_MS });
 

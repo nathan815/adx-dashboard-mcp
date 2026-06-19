@@ -190,7 +190,10 @@ export const daemon = {
   pull: (id) => call('POST', `/dashboards/${enc(id)}/pull`, {}, { context: 'Pull dashboard' }),
   // Apply blocks on the daemon's long-poll for user approval (EDIT_TIMEOUT_MS
   // is 120s server-side), so give the client a little headroom above that.
-  apply: (id) => call('POST', `/dashboards/${enc(id)}/apply`, {}, { timeoutMs: 150000, context: 'Apply' }),
+  // skipConfirmation auto-clicks ADX's per-apply "Continue" dialog so the edit
+  // actually commits; the one-time "Allow Edits" consent is the human gate.
+  apply: (id, { skipConfirmation = true } = {}) =>
+    call('POST', `/dashboards/${enc(id)}/apply`, { skipConfirmation }, { timeoutMs: 150000, context: 'Apply' }),
   discard: (id) => call('POST', `/dashboards/${enc(id)}/discard`, {}, { context: 'Discard' }),
   refresh: (id) => call('POST', `/dashboards/${enc(id)}/refresh`, {}, { context: 'Refresh' }),
   getErrors: (id) => call('GET', `/dashboards/${enc(id)}/errors`, undefined, { context: 'Get errors' }),

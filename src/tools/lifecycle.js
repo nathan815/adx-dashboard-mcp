@@ -12,10 +12,18 @@ export function registerLifecycleTools(server) {
     {
       title: 'Apply edits',
       description:
-        'Push the dashboard\'s working copy to the open browser tab and block until you approve (or reject) it there. Refuses if the dashboard is open in more than one tab. Returns the apply result including any per-tile render errors.',
-      inputSchema: { dashboardId: z.string() },
+        'Push the dashboard\'s working copy to the open browser tab and block until you approve (or reject) it there. Refuses if the dashboard is open in more than one tab. By default auto-confirms ADX\'s "Continue" dialog so the edit commits; set autoConfirm:false to upload the JSON but leave the confirm dialog open for a manual click. Returns the apply result including any per-tile render errors.',
+      inputSchema: {
+        dashboardId: z.string(),
+        autoConfirm: z
+          .boolean()
+          .optional()
+          .describe(
+            'Auto-click ADX\'s "Continue" confirmation so the edit actually commits (default true). Set false to leave the dialog open for a manual click.'
+          ),
+      },
     },
-    handler(async ({ dashboardId }, extra) => {
+    handler(async ({ dashboardId, autoConfirm = true }, extra) => {
       // While the daemon long-polls for the user's approval, emit MCP progress
       // notifications so the client shows a live pending state instead of an
       // opaque hang. Only fire when the caller supplied a progress token.
@@ -49,16 +57,43 @@ export function registerLifecycleTools(server) {
           }, 3000);
         }
 
-        const body = await daemon.apply(dashboardId);
+        const body = await daemon.apply(dashboardId, { skipConfirmation: autoConfirm });
         // A page-side apply failure comes back as HTTP 200 { ok:false, result },
         // which call() does not treat as an error, so check it here.
         if (body && body.ok === false) {
+          const result = body.result || {};
+          const pageMessage = result.error || result.message;
+
+          // The page returns pendingAuthorization the first time a dashboard is
+          // edited: it opens an "Allow Edits" consent dialog and bails out fast
+          // (this is not a timeout). Surface it as its own actionable code so the
+          // agent tells the user to approve once, then re-run apply.
+          if (result.pendingAuthorization) {
+            return errorResult(
+              new DaemonError(
+                pageMessage ||
+                  'Approval required: click "Allow Edits" in the ADX dashboard tab, then run apply again.',
+                {
+                  status: 200,
+                  code: 'pending_authorization',
+                  details: { hint: 'Click "Allow Edits" in the browser tab once, then re-run apply.' },
+                }
+              )
+            );
+          }
+
           return errorResult(
-            new DaemonError('Apply did not complete on the page', {
-              status: 200,
-              code: 'apply_failed',
-              response: body.result,
-            })
+            new DaemonError(
+              pageMessage
+                ? `Apply did not complete on the page: ${pageMessage}`
+                : 'Apply did not complete on the page',
+              {
+                status: 200,
+                code: 'apply_failed',
+                details: result,
+                response: body.result,
+              }
+            )
           );
         }
         return jsonResult(body.result ?? body);

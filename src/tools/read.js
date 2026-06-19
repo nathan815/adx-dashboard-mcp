@@ -121,4 +121,23 @@ export function registerReadTools(server) {
       return jsonResult(body);
     })
   );
+
+  server.registerTool(
+    'get_schema_for_dashboard',
+    {
+      title: 'Get schema for dashboard',
+      description:
+        'Fetch the cached ADX dashboard schema at the version a specific dashboard actually uses. Resolves the dashboard\'s schema_version for you, so you never have to guess or pass a version. Pass file (e.g. "tile.json", "query.json") to get just that file, or omit it to get the whole { filename: schema } graph. Returns { dashboardId, schemaVersion, file, schema }.',
+      inputSchema: {
+        dashboardId: z.string(),
+        file: z.string().optional().describe('Schema file name, e.g. "tile.json". Omit to get the whole graph.'),
+      },
+    },
+    handler(async ({ dashboardId, file }) => {
+      const summary = await withAutoPull(dashboardId, () => daemon.summary(dashboardId));
+      const schemaVersion = summary.result.schema_version;
+      const schema = await daemon.getSchema(file, schemaVersion);
+      return jsonResult({ dashboardId, schemaVersion, file: file ?? null, schema });
+    })
+  );
 }

@@ -4,15 +4,16 @@
  * Validate an ADX dashboard JSON object against the official ADX dashboard schema.
  *
  * Migrated from the adx-dashboard-authoring skill (scripts/validate.js) and converted
- * from CommonJS to ESM. Behavior is intentionally identical to the original so the
- * daemon can validate before applying an edit. The schema cache still lands at the
- * nearest package.json (the repo root here); relocating the cache to a stable home
- * directory is handled separately by the daemon's store layer.
+ * from CommonJS to ESM. Validation behavior is intentionally identical to the original.
+ * The one change from the migration baseline is the cache location: the schema graph now
+ * lands under a stable home directory (cacheRoot) instead of the repo root, so it survives
+ * across npx runs where the cwd is a throwaway temp dir.
  */
 
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { pathToFileURL } from 'node:url';
 
 // ajv and ajv-formats are CommonJS. Node's interop exposes the class/function as the
 // default export, but guard for the {default} shape so this keeps working if the
@@ -23,27 +24,18 @@ import _addFormats from 'ajv-formats';
 const Ajv2020 = _Ajv2020.default ?? _Ajv2020;
 const addFormats = _addFormats.default ?? _addFormats;
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-
 // Dashboards that omit schema_version are assumed to target the current ADX schema.
 const DEFAULT_SCHEMA_VERSION = 76;
 const SCHEMA_HOST = 'https://dataexplorer.azure.com';
 
-// Walk up from this file to the nearest package.json so the on-disk schema cache
-// lands at the skill root regardless of where this file sits (scripts/ vs root).
-function findSkillRoot() {
-  let dir = __dirname;
-  for (let i = 0; i < 6; i++) {
-    if (fs.existsSync(path.join(dir, 'package.json'))) return dir;
-    const parent = path.dirname(dir);
-    if (parent === dir) break;
-    dir = parent;
-  }
-  return __dirname;
+// The cache lives under a stable home dir so it survives across npx runs, where the
+// cwd is a throwaway temp dir. ADX_LIVE_EDIT_HOME lets tests and CI redirect it.
+function cacheRoot() {
+  return process.env.ADX_LIVE_EDIT_HOME || path.join(os.homedir(), '.adx-live-edit-mcp');
 }
 
 function cacheDirFor(version) {
-  return path.join(findSkillRoot(), '.cache', 'schema', String(version));
+  return path.join(cacheRoot(), 'schema', String(version));
 }
 
 function resolveSchemaVersion(dashboard) {
@@ -175,10 +167,12 @@ export {
   validateDashboard,
   resolveSchemaVersion,
   loadSchemaGraph,
+  getSchemaFileText,
   cacheDirFor,
+  cacheRoot,
   DEFAULT_SCHEMA_VERSION,
 };
 
-if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   main();
 }

@@ -24,6 +24,9 @@
 
 import http from 'node:http';
 import { randomUUID } from 'node:crypto';
+import * as store from './store.js';
+import * as patch from './patch.js';
+import { DEFAULT_SCHEMA_VERSION } from '../shared/validate.js';
 
 const PORT = parseInt(process.argv.find((_, i, a) => a[i-1] === '--port') || '9876');
 const EDIT_TIMEOUT_MS = 120000;
@@ -36,6 +39,22 @@ const POLL_TIMEOUT_MS = 30000;
 // ADX_SKIP_VALIDATION=1 is a deliberate escape hatch for the rare case where
 // ADX's own published schema is wrong; it disables this gate.
 const SKIP_VALIDATION = process.env.ADX_SKIP_VALIDATION === '1';
+
+// Maps a POST subpath under /dashboards/:id to the element-level mutator that applies
+// it to the working copy. Keeping it data-driven means the router stays small and every
+// write flows through the same load -> mutate -> validate -> persist path.
+const STORE_WRITE_ROUTES = {
+  'set-query': (dash, body) => patch.setQuery(dash, body),
+  'set-query-datasource': (dash, body) => patch.setQueryDatasource(dash, body),
+  'set-tile': (dash, body) => patch.setTile(dash, body),
+  'set-layout': (dash, body) => patch.setLayout(dash, body),
+  'add-tile': (dash, body) => patch.addTile(dash, body),
+  'remove-tile': (dash, body) => patch.removeTile(dash, body),
+  'set-parameter': (dash, body) => patch.setParameter(dash, body),
+  'add-parameter': (dash, body) => patch.addParameter(dash, body),
+  'remove-parameter': (dash, body) => patch.removeParameter(dash, body),
+  'rename-page': (dash, body) => patch.renamePage(dash, body)
+};
 
 // Loaded lazily so read-only commands keep working even when deps are missing.
 // Only the edit path needs the validator. ESM dynamic import is async, so the
@@ -59,7 +78,9 @@ const pendingEdits = new Map();
 const pendingGets = new Map();
 const pendingActions = new Map();  // Generic actions (getPages, selectPage, etc.)
 const waitingPollers = [];  // Extension's long-poll requests
-const connectedDashboards = new Map();  // id -> {id, title, connectedAt}
+// dashboardId -> Map(instanceId -> {instanceId, title, connectedAt}). Each browser tab
+// is its own instance so apply can refuse when more than one tab targets a dashboard.
+const connectedDashboards = new Map();
 
 function log(msg) {
   const time = new Date().toLocaleTimeString('en-US', { hour12: false });
@@ -142,6 +163,126 @@ function parseBody(req) {
   });
 }
 
+// --- Stateful backend helpers ----------------------------------------------------
+
+// Register or refresh one browser tab for a dashboard. Returns true when this is the
+// first time we have seen the instance.
+function touchInstance(dashboardId, instanceId, title) {
+  if (!dashboardId || !instanceId) return false;
+  let instances = connectedDashboards.get(dashboardId);
+  if (!instances) {
+    instances = new Map();
+    connectedDashboards.set(dashboardId, instances);
+  }
+  const prev = instances.get(instanceId);
+  instances.set(instanceId, {
+    instanceId,
+    title: title || (prev && prev.title) || 'Untitled',
+    connectedAt: prev ? prev.connectedAt : Date.now()
+  });
+  return !prev;
+}
+
+function instancesFor(dashboardId) {
+  const instances = connectedDashboards.get(dashboardId);
+  return instances ? Array.from(instances.values()) : [];
+}
+
+function removeInstance(dashboardId, instanceId) {
+  const instances = connectedDashboards.get(dashboardId);
+  if (!instances) return;
+  if (instanceId) instances.delete(instanceId);
+  else instances.clear();
+  if (instances.size === 0) connectedDashboards.delete(dashboardId);
+}
+
+// Run the schema validator and return a problem ({status, body}) when the dashboard is
+// invalid or the validator could not run, or null when it passes. Shared by /edit,
+// store patches, and apply so they all gate on the same authoritative check.
+async function validateOrProblem(dashboard) {
+  if (SKIP_VALIDATION) return null;
+  const { fn, err } = await getValidator();
+  if (err) {
+    return { status: 500, body: {
+      error: 'Validation could not run on the server',
+      detail: err.message,
+      hint: 'Run `npm install` so the validator (ajv) is available, or set ADX_SKIP_VALIDATION=1 to bypass.'
+    } };
+  }
+  let validation;
+  try {
+    validation = await fn(dashboard);
+  } catch (e) {
+    return { status: 500, body: {
+      error: 'Validation could not run on the server',
+      detail: e.message,
+      hint: 'Check network access to the ADX schema host or a populated schema cache dir.'
+    } };
+  }
+  if (!validation.valid) {
+    return { status: 400, body: {
+      error: 'Dashboard failed schema validation',
+      code: 'validation_failed',
+      validationErrors: validation.errors
+    } };
+  }
+  return null;
+}
+
+// Queue an edit for the page and block until the extension reports a result (or we time
+// out). Extracted from handleEdit so apply reuses the exact same approval/long-poll flow.
+async function queueEditAndWait(dashboardId, dashboard, opts = {}) {
+  const editId = randomUUID();
+  const edit = {
+    id: editId,
+    dashboardId,
+    dashboard,
+    description: opts.description || 'Agent edit',
+    skipConfirmation: opts.skipConfirmation || false,
+    filename: opts.filename || 'agent-edit.json',
+    createdAt: Date.now(),
+    expiresAt: Date.now() + EDIT_TIMEOUT_MS,
+    result: null,
+    resolve: null
+  };
+
+  const resultPromise = new Promise((resolve) => { edit.resolve = resolve; });
+  pendingEdits.set(editId, edit);
+  log(`Edit queued: ${editId} for dashboard ${dashboardId}`);
+  notifyPollers();
+
+  const timeoutPromise = new Promise((resolve) =>
+    setTimeout(() => resolve({ timeout: true }), EDIT_TIMEOUT_MS)
+  );
+  const result = await Promise.race([resultPromise, timeoutPromise]);
+  pendingEdits.delete(editId);
+  return { editId, result };
+}
+
+// Ask the page for its current dashboard JSON and block until it answers (or times out).
+// Returns the page result ({ dashboard, title, meta, selectedPageId }) or { timeout: true }.
+async function requestDashboardFromPage(dashboardId) {
+  const getId = randomUUID();
+  const get = {
+    id: getId,
+    dashboardId: dashboardId || '*',
+    createdAt: Date.now(),
+    result: null,
+    resolve: null
+  };
+  const resultPromise = new Promise((resolve) => { get.resolve = resolve; });
+  pendingGets.set(getId, get);
+  log(`Get queued: ${getId} for dashboard ${get.dashboardId}`);
+  notifyPollers();
+
+  const timeoutPromise = new Promise((resolve) =>
+    setTimeout(() => resolve({ timeout: true }), GET_TIMEOUT_MS)
+  );
+  const result = await Promise.race([resultPromise, timeoutPromise]);
+  pendingGets.delete(getId);
+  return result;
+}
+
 // Route handlers
 async function handleStatus(req, res) {
   sendJson(res, {
@@ -165,69 +306,16 @@ async function handleEdit(req, res, dashboardIdFromPath) {
   }
 
   // Validate before queuing so a bad edit can never reach the browser, even when
-  // the caller skipped client.js and hit this endpoint directly.
-  if (!SKIP_VALIDATION) {
-    const { fn, err } = await getValidator();
-    if (err) {
-      return sendJson(res, {
-        error: 'Validation could not run on the server',
-        detail: err.message,
-        hint: 'Run `npm install` in the adx-dashboard-live-edit skill so the validator (ajv) is available, or set ADX_SKIP_VALIDATION=1 to bypass.'
-      }, 500);
-    }
-    let validation;
-    try {
-      validation = await fn(data.dashboard);
-    } catch (e) {
-      return sendJson(res, {
-        error: 'Validation could not run on the server',
-        detail: e.message,
-        hint: 'Check network access to the ADX schema host or a populated .cache/schema dir.'
-      }, 500);
-    }
-    if (!validation.valid) {
-      return sendJson(res, {
-        error: 'Dashboard failed schema validation; edit not applied',
-        validationErrors: validation.errors,
-        hint: 'Fix the JSON in the authoring skill and re-validate before applying.'
-      }, 400);
-    }
-  }
+  // the caller skipped the MCP layer and hit this endpoint directly.
+  const problem = await validateOrProblem(data.dashboard);
+  if (problem) return sendJson(res, problem.body, problem.status);
 
-  const editId = randomUUID();
   const dashboardId = dashboardIdFromPath || data.dashboardId || '*';
-
-  const edit = {
-    id: editId,
-    dashboardId,
-    dashboard: data.dashboard,
+  const { editId, result } = await queueEditAndWait(dashboardId, data.dashboard, {
     description: data.description || 'Agent edit',
     skipConfirmation: data.skipConfirmation || false,
-    filename: data.filename || 'agent-edit.json',
-    createdAt: Date.now(),
-    expiresAt: Date.now() + EDIT_TIMEOUT_MS,
-    result: null,
-    resolve: null
-  };
-
-  // Create promise that will be resolved when result arrives
-  const resultPromise = new Promise((resolve) => {
-    edit.resolve = resolve;
+    filename: data.filename || 'agent-edit.json'
   });
-
-  pendingEdits.set(editId, edit);
-  log(`Edit queued: ${editId} for dashboard ${dashboardId}`);
-
-  // Wake up any waiting pollers
-  notifyPollers();
-
-  // Wait for result with timeout
-  const timeoutPromise = new Promise((resolve) =>
-    setTimeout(() => resolve({ timeout: true }), EDIT_TIMEOUT_MS)
-  );
-
-  const result = await Promise.race([resultPromise, timeoutPromise]);
-  pendingEdits.delete(editId);
 
   if (result.timeout) {
     log(`Edit timeout: ${editId}`);
@@ -243,52 +331,30 @@ async function handleEdit(req, res, dashboardIdFromPath) {
 
 async function handleDashboardGet(req, res, dashboardIdFromPath) {
   const dashboardId = dashboardIdFromPath || '*';
-
-  const getId = randomUUID();
-  const get = {
-    id: getId,
-    dashboardId,
-    createdAt: Date.now(),
-    result: null,
-    resolve: null
-  };
-
-  const resultPromise = new Promise((resolve) => {
-    get.resolve = resolve;
-  });
-
-  pendingGets.set(getId, get);
-  log(`Get queued: ${getId} for dashboard ${dashboardId}`);
-
-  // Wake up any waiting pollers
-  notifyPollers();
-
-  const timeoutPromise = new Promise((resolve) =>
-    setTimeout(() => resolve({ timeout: true }), GET_TIMEOUT_MS)
-  );
-
-  const result = await Promise.race([resultPromise, timeoutPromise]);
-  pendingGets.delete(getId);
+  const result = await requestDashboardFromPage(dashboardId);
 
   if (result.timeout) {
-    log(`Get timeout: ${getId}`);
     return sendJson(res, {
       error: 'Timeout waiting for dashboard data',
       hint: 'Make sure the ADX dashboard is open'
     }, 504);
   }
 
-  log(`Get completed: ${getId}`);
   sendJson(res, result);
 }
 
 async function handlePoll(req, res) {
   const url = new URL(req.url, `http://localhost:${PORT}`);
   const dashboardId = url.searchParams.get('dashboardId');
+  const instanceId = url.searchParams.get('instanceId') || dashboardId;
 
   if (!dashboardId) {
     return sendJson(res, { error: 'Missing dashboardId' }, 400);
   }
+
+  // Pollers re-register their instance on every poll so a daemon restart relearns the
+  // connected tabs without waiting for a fresh /connect.
+  touchInstance(dashboardId, instanceId);
 
   // Check if there's already a pending command
   for (const [id, get] of pendingGets) {
@@ -390,15 +456,11 @@ async function handleConnect(req, res) {
     return sendJson(res, { error: 'Missing dashboardId' }, 400);
   }
 
-  const isNew = !connectedDashboards.has(dashboardId);
-  connectedDashboards.set(dashboardId, {
-    id: dashboardId,
-    title: title || 'Untitled',
-    connectedAt: Date.now()
-  });
-
+  // Default instanceId to dashboardId so the legacy extension (no per-tab id) still works.
+  const instanceId = data.instanceId || dashboardId;
+  const isNew = touchInstance(dashboardId, instanceId, title);
   if (isNew) {
-    log(`Extension connected: ${dashboardId} "${title || 'Untitled'}"`);
+    log(`Extension connected: ${dashboardId} "${title || 'Untitled'}" (instance ${instanceId})`);
   }
 
   sendJson(res, { ok: true });
@@ -414,16 +476,26 @@ async function handleDisconnect(req, res) {
 
   const { dashboardId } = data;
   if (dashboardId && connectedDashboards.has(dashboardId)) {
-    const info = connectedDashboards.get(dashboardId);
-    connectedDashboards.delete(dashboardId);
-    log(`Extension disconnected: ${dashboardId} "${info.title}"`);
+    const instanceId = data.instanceId || dashboardId;
+    removeInstance(dashboardId, instanceId);
+    log(`Extension disconnected: ${dashboardId} (instance ${instanceId})`);
   }
 
   sendJson(res, { ok: true });
 }
 
 async function handleDashboards(req, res) {
-  const dashboards = Array.from(connectedDashboards.values());
+  const dashboards = [];
+  for (const [dashboardId, instances] of connectedDashboards) {
+    const list = Array.from(instances.values());
+    const first = list[0] || {};
+    dashboards.push({
+      id: dashboardId,
+      title: first.title || 'Untitled',
+      connectedAt: first.connectedAt || null,
+      instanceCount: list.length
+    });
+  }
   sendJson(res, { dashboards });
 }
 
@@ -584,6 +656,209 @@ async function handleSelectPage(req, res, dashboardIdFromPath) {
   sendJson(res, result);
 }
 
+// --- Stateful backend route handlers ---------------------------------------------
+
+// Run a pure read view over the working copy. readFn receives the dashboard and returns
+// a friendly typed result; it must never expose the raw normalized JSON.
+async function handleStoreRead(req, res, dashboardId, readFn) {
+  if (!store.hasWorking(dashboardId)) {
+    return sendJson(res, {
+      error: 'No working copy for this dashboard',
+      code: 'no_working_copy',
+      hint: 'Call pull first to load the dashboard from the open tab.'
+    }, 409);
+  }
+  let dash;
+  try {
+    dash = store.loadWorking(dashboardId);
+  } catch (e) {
+    return sendJson(res, { error: e.message, code: 'store_read_failed' }, 500);
+  }
+  try {
+    const result = readFn(dash);
+    sendJson(res, { ok: true, result });
+  } catch (e) {
+    if (e instanceof patch.PatchError) {
+      return sendJson(res, { error: e.message, code: e.code, details: e.details }, 400);
+    }
+    sendJson(res, { error: e.message, code: 'internal_error' }, 500);
+  }
+}
+
+// Apply one element-level mutator to the working copy: load, mutate in place, validate,
+// then persist. The agent never sees or sends the normalized JSON; it sends typed fields.
+async function handleStorePatch(req, res, dashboardId, patchFn) {
+  if (!store.hasWorking(dashboardId)) {
+    return sendJson(res, {
+      error: 'No working copy for this dashboard',
+      code: 'no_working_copy',
+      hint: 'Call pull first to load the dashboard from the open tab.'
+    }, 409);
+  }
+  let body;
+  try {
+    body = await parseBody(req);
+  } catch (e) {
+    return sendJson(res, { error: 'Invalid JSON', code: 'invalid_input' }, 400);
+  }
+  let dash;
+  try {
+    dash = store.loadWorking(dashboardId);
+  } catch (e) {
+    return sendJson(res, { error: e.message, code: 'store_read_failed' }, 500);
+  }
+
+  let outcome;
+  try {
+    outcome = patchFn(dash, body);
+  } catch (e) {
+    if (e instanceof patch.PatchError) {
+      return sendJson(res, { error: e.message, code: e.code, details: e.details }, 400);
+    }
+    return sendJson(res, { error: e.message, code: 'internal_error' }, 500);
+  }
+
+  const problem = await validateOrProblem(dash);
+  if (problem) return sendJson(res, problem.body, problem.status);
+
+  try {
+    store.writeWorking(dashboardId, dash);
+  } catch (e) {
+    return sendJson(res, { error: e.message, code: 'store_write_failed' }, 500);
+  }
+
+  sendJson(res, { ok: true, result: outcome.result, warnings: outcome.warnings || [] });
+}
+
+// Pull the live dashboard JSON from the open tab and seed both the saved and working
+// copies from it. This is the entry point before any read/edit can happen.
+async function handlePull(req, res, dashboardId) {
+  const result = await requestDashboardFromPage(dashboardId);
+  if (result.timeout) {
+    return sendJson(res, {
+      error: 'Timeout waiting for dashboard data',
+      code: 'page_timeout',
+      hint: 'Make sure the ADX dashboard tab is open.'
+    }, 504);
+  }
+  if (result.error) {
+    return sendJson(res, { error: result.error, code: 'page_error' }, 502);
+  }
+  if (!result.dashboard) {
+    return sendJson(res, {
+      error: 'Page returned no dashboard JSON',
+      code: 'page_no_dashboard'
+    }, 502);
+  }
+
+  try {
+    store.setSavedAndWorking(dashboardId, result.dashboard);
+  } catch (e) {
+    return sendJson(res, { error: e.message, code: 'store_write_failed' }, 500);
+  }
+  sendJson(res, { ok: true, result: patch.dashboardSummary(result.dashboard) });
+}
+
+// Push the working copy to the page through the approval/long-poll flow, then promote
+// working -> saved on success. Refuses when more than one tab targets the dashboard.
+async function handleApply(req, res, dashboardId) {
+  if (!store.hasWorking(dashboardId)) {
+    return sendJson(res, {
+      error: 'No working copy to apply',
+      code: 'no_working_copy',
+      hint: 'Call pull first to load the dashboard from the open tab.'
+    }, 409);
+  }
+
+  let body = {};
+  try {
+    body = await parseBody(req);
+  } catch (e) {
+    // apply takes no required body; ignore parse errors and use defaults.
+  }
+
+  const instances = instancesFor(dashboardId);
+  if (instances.length > 1) {
+    return sendJson(res, {
+      error: 'More than one tab is open for this dashboard; refusing to apply',
+      code: 'multiple_instances',
+      instances: instances.map(i => ({ instanceId: i.instanceId, title: i.title }))
+    }, 409);
+  }
+
+  let dash;
+  try {
+    dash = store.loadWorking(dashboardId);
+  } catch (e) {
+    return sendJson(res, { error: e.message, code: 'store_read_failed' }, 500);
+  }
+
+  const problem = await validateOrProblem(dash);
+  if (problem) return sendJson(res, problem.body, problem.status);
+
+  const { result } = await queueEditAndWait(dashboardId, dash, {
+    description: body.description || 'Agent edit',
+    skipConfirmation: body.skipConfirmation || false,
+    filename: body.filename || 'agent-edit.json'
+  });
+
+  if (result.timeout) {
+    return sendJson(res, {
+      error: 'Timeout waiting for the extension to apply the edit',
+      code: 'page_timeout',
+      hint: 'Make sure the ADX dashboard tab is open and approve the edit.'
+    }, 504);
+  }
+  if (result.success === false) {
+    return sendJson(res, { ok: false, result }, 200);
+  }
+
+  try {
+    store.promoteWorkingToSaved(dashboardId);
+  } catch (e) {
+    return sendJson(res, { error: e.message, code: 'store_write_failed' }, 500);
+  }
+  sendJson(res, { ok: true, result });
+}
+
+// Throw away working edits and restore working <- saved.
+async function handleDiscard(req, res, dashboardId) {
+  try {
+    store.discard(dashboardId);
+  } catch (e) {
+    return sendJson(res, {
+      error: e.message,
+      code: 'no_saved_copy',
+      hint: 'Nothing has been pulled for this dashboard yet.'
+    }, 409);
+  }
+  sendJson(res, { ok: true, result: patch.dashboardSummary(store.loadWorking(dashboardId)) });
+}
+
+// Serve a single schema file from the daemon-owned cache. GET /schema?file=tile.json&version=76
+async function handleSchema(req, res) {
+  const url = new URL(req.url, `http://localhost:${PORT}`);
+  const file = url.searchParams.get('file');
+  const version = url.searchParams.get('version') || String(DEFAULT_SCHEMA_VERSION);
+  if (!file) {
+    return sendJson(res, {
+      error: 'Missing file query parameter',
+      code: 'invalid_input',
+      hint: 'Pass ?file=dashboard.json (and optional &version=76).'
+    }, 400);
+  }
+  try {
+    const text = await store.readSchemaFile(version, file);
+    res.writeHead(200, {
+      'Content-Type': 'application/json',
+      'Access-Control-Allow-Origin': '*'
+    });
+    res.end(text);
+  } catch (e) {
+    sendJson(res, { error: e.message, code: 'schema_read_failed' }, 502);
+  }
+}
+
 function handleCors(req, res) {
   res.writeHead(204, {
     'Access-Control-Allow-Origin': '*',
@@ -611,28 +886,56 @@ const server = http.createServer(async (req, res) => {
       await handleStatus(req, res);
     } else if (path === '/dashboards' && req.method === 'GET') {
       await handleDashboards(req, res);
+    } else if (path === '/schema' && req.method === 'GET') {
+      await handleSchema(req, res);
     } else if (dashboardMatch) {
       const dashboardId = dashboardMatch[1];
       const subPath = dashboardMatch[3] || '';
+      const segs = subPath ? subPath.split('/') : [];
+      const method = req.method;
 
-      if (!subPath && req.method === 'GET') {
-        // GET /dashboards/:id - get dashboard JSON
+      // Browser-facing routes (the extension talks to these). Keep them as-is.
+      if (!subPath && method === 'GET') {
         await handleDashboardGet(req, res, dashboardId);
-      } else if (subPath === 'pages' && req.method === 'GET') {
-        // GET /dashboards/:id/pages
+      } else if (subPath === 'pages' && method === 'GET') {
         await handlePages(req, res, dashboardId);
-      } else if (subPath === 'selectPage' && req.method === 'POST') {
-        // POST /dashboards/:id/selectPage
+      } else if (subPath === 'selectPage' && method === 'POST') {
         await handleSelectPage(req, res, dashboardId);
-      } else if (subPath === 'edit' && req.method === 'POST') {
-        // POST /dashboards/:id/edit
+      } else if (subPath === 'edit' && method === 'POST') {
         await handleEdit(req, res, dashboardId);
-      } else if (subPath === 'refresh' && req.method === 'POST') {
-        // POST /dashboards/:id/refresh
+      } else if (subPath === 'refresh' && method === 'POST') {
         await handleRefresh(req, res, dashboardId);
-      } else if (subPath === 'errors' && req.method === 'GET') {
-        // GET /dashboards/:id/errors
+      } else if (subPath === 'errors' && method === 'GET') {
         await handleErrors(req, res, dashboardId);
+
+      // Lifecycle: move the working copy between the page, saved, and discarded.
+      } else if (subPath === 'pull' && method === 'POST') {
+        await handlePull(req, res, dashboardId);
+      } else if (subPath === 'apply' && method === 'POST') {
+        await handleApply(req, res, dashboardId);
+      } else if (subPath === 'discard' && method === 'POST') {
+        await handleDiscard(req, res, dashboardId);
+
+      // Typed read views over the working copy (never the raw normalized JSON).
+      } else if (subPath === 'summary' && method === 'GET') {
+        await handleStoreRead(req, res, dashboardId, (d) => patch.dashboardSummary(d));
+      } else if (subPath === 'page-list' && method === 'GET') {
+        await handleStoreRead(req, res, dashboardId, (d) => patch.listPages(d));
+      } else if (subPath === 'parameters' && method === 'GET') {
+        await handleStoreRead(req, res, dashboardId, (d) => patch.getParameters(d));
+      } else if (segs[0] === 'tiles' && segs.length === 1 && method === 'GET') {
+        const pageId = url.searchParams.get('pageId');
+        await handleStoreRead(req, res, dashboardId, (d) => patch.listTiles(d, pageId));
+      } else if (segs[0] === 'tiles' && segs.length === 2 && method === 'GET') {
+        const tileId = decodeURIComponent(segs[1]);
+        await handleStoreRead(req, res, dashboardId, (d) => patch.getTile(d, tileId));
+      } else if (segs[0] === 'tiles' && segs.length === 3 && segs[2] === 'query' && method === 'GET') {
+        const tileId = decodeURIComponent(segs[1]);
+        await handleStoreRead(req, res, dashboardId, (d) => patch.getQuery(d, tileId));
+
+      // Typed element writes against the working copy.
+      } else if (method === 'POST' && STORE_WRITE_ROUTES[subPath]) {
+        await handleStorePatch(req, res, dashboardId, STORE_WRITE_ROUTES[subPath]);
       } else {
         sendJson(res, { error: 'Not found' }, 404);
       }

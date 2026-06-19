@@ -2,6 +2,10 @@
   'use strict';
 
   const AGENT_SERVER_PORT = 9876;
+  // Per-load tab identity so the daemon can tell multiple open tabs of the same
+  // dashboard apart and refuse a mutating apply when more than one is connected.
+  const INSTANCE_ID = (crypto && crypto.randomUUID) ? crypto.randomUUID()
+    : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
   const authorizedDashboards = new Set();
   const pendingAuthDashboards = new Set();
   const handledEditIds = new Set();
@@ -399,7 +403,7 @@
 
     try {
       const response = await fetch(
-        `http://localhost:${AGENT_SERVER_PORT}/poll?dashboardId=${dashboardId}`,
+        `http://localhost:${AGENT_SERVER_PORT}/poll?dashboardId=${dashboardId}&instanceId=${INSTANCE_ID}`,
         { signal: pollAbortController.signal }
       );
       polling = false;
@@ -644,7 +648,7 @@
       await fetch(`http://localhost:${AGENT_SERVER_PORT}/connect`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ dashboardId, title: dashData.title })
+        body: JSON.stringify({ dashboardId, title: dashData.title, instanceId: INSTANCE_ID })
       });
       return true;
     } catch (e) {
@@ -658,7 +662,7 @@
     // Use sendBeacon for reliable delivery during page unload
     navigator.sendBeacon(
       `http://localhost:${AGENT_SERVER_PORT}/disconnect`,
-      JSON.stringify({ dashboardId: currentDashboardId })
+      JSON.stringify({ dashboardId: currentDashboardId, instanceId: INSTANCE_ID })
     );
   }
 
@@ -679,7 +683,7 @@
     if (currentDashboardId) {
       navigator.sendBeacon(
         `http://localhost:${AGENT_SERVER_PORT}/disconnect`,
-        JSON.stringify({ dashboardId: currentDashboardId })
+        JSON.stringify({ dashboardId: currentDashboardId, instanceId: INSTANCE_ID })
       );
       // Abort any pending poll
       if (pollAbortController) {

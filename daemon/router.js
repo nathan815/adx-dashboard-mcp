@@ -26,5 +26,12 @@ export function createRouter() {
     return null;
   }
 
-  return { route, match };
+  return {
+    match,
+    route,
+    get: (pattern, handler) => route('GET', pattern, handler),
+    post: (pattern, handler) => route('POST', pattern, handler),
+    put: (pattern, handler) => route('PUT', pattern, handler),
+    delete: (pattern, handler) => route('DELETE', pattern, handler)
+  };
 }

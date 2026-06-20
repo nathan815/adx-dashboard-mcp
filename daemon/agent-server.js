@@ -31,21 +31,11 @@ const GET_TIMEOUT_MS = 10000;
 const ACTION_TIMEOUT_MS = 10000;
 const POLL_TIMEOUT_MS = 30000;
 
-// Maps a POST subpath under /dashboards/:id to the element-level mutator that applies
-// it to the working copy. Keeping it data-driven means the router stays small and every
-// write flows through the same load -> mutate -> validate -> persist path.
-const STORE_WRITE_ROUTES = {
-  'set-query': (dash, body) => patch.setQuery(dash, body),
-  'set-query-datasource': (dash, body) => patch.setQueryDatasource(dash, body),
-  'set-tile': (dash, body) => patch.setTile(dash, body),
-  'set-layout': (dash, body) => patch.setLayout(dash, body),
-  'add-tile': (dash, body) => patch.addTile(dash, body),
-  'remove-tile': (dash, body) => patch.removeTile(dash, body),
-  'set-parameter': (dash, body) => patch.setParameter(dash, body),
-  'add-parameter': (dash, body) => patch.addParameter(dash, body),
-  'remove-parameter': (dash, body) => patch.removeParameter(dash, body),
-  'rename-page': (dash, body) => patch.renamePage(dash, body)
-};
+// Only the ADX dashboard page legitimately calls the daemon from a browser, and
+// that is the single origin the extension content script runs on. The MCP client
+// uses node:http, sends no Origin, and ignores CORS, so locking this down keeps
+// any other web page from reaching the daemon without affecting the MCP path.
+const ALLOWED_ORIGIN = 'https://dataexplorer.azure.com';
 
 // Loaded lazily so read-only commands keep working even when deps are missing.
 // Only the edit path needs the validator. ESM dynamic import is async, so the
@@ -135,7 +125,7 @@ function handlePollResponse(res, dashboardId) {
 function sendJson(res, data, status = 200) {
   res.writeHead(status, {
     'Content-Type': 'application/json',
-    'Access-Control-Allow-Origin': '*'
+    'Access-Control-Allow-Origin': ALLOWED_ORIGIN
   });
   res.end(JSON.stringify(data));
 }
@@ -882,14 +872,14 @@ async function handleSchema(req, res) {
       const graph = await store.readSchemaGraph(version);
       res.writeHead(200, {
         'Content-Type': 'application/json',
-        'Access-Control-Allow-Origin': '*'
+        'Access-Control-Allow-Origin': ALLOWED_ORIGIN
       });
       return res.end(JSON.stringify(graph));
     }
     const text = await store.readSchemaFile(version, file);
     res.writeHead(200, {
       'Content-Type': 'application/json',
-      'Access-Control-Allow-Origin': '*'
+      'Access-Control-Allow-Origin': ALLOWED_ORIGIN
     });
     res.end(text);
   } catch (e) {
@@ -899,50 +889,60 @@ async function handleSchema(req, res) {
 
 function handleCors(req, res) {
   res.writeHead(204, {
-    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Origin': ALLOWED_ORIGIN,
     'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type'
   });
   res.end();
 }
 
-// Generic route registry lives in router.js; this file just registers the
-// daemon's endpoints against it.
-const { route, match: matchRoute } = createRouter();
+const router = createRouter();
 
 // Top-level endpoints.
-route('GET', '/status', handleStatus);
-route('GET', '/dashboards', handleDashboards);
-route('GET', '/schema', handleSchema);
-route('POST', '/connect', handleConnect);
-route('POST', '/disconnect', handleDisconnect);
-route('GET', '/poll', handlePoll);
-route('POST', '/result', handleResult);
+router.get('/status', handleStatus);
+router.get('/dashboards', handleDashboards);
+router.get('/schema', handleSchema);
+router.post('/connect', handleConnect);
+router.post('/disconnect', handleDisconnect);
+router.get('/poll', handlePoll);
+router.post('/result', handleResult);
 
-// Browser-facing dashboard routes (the extension talks to these).
-route('GET', '/dashboards/:id', (req, res, { params }) => handleDashboardGet(req, res, params.id));
-route('GET', '/dashboards/:id/pages', (req, res, { params }) => handlePages(req, res, params.id));
-route('POST', '/dashboards/:id/selectPage', (req, res, { params }) => handleSelectPage(req, res, params.id));
-route('POST', '/dashboards/:id/edit', (req, res, { params }) => handleEdit(req, res, params.id));
-route('POST', '/dashboards/:id/refresh', (req, res, { params }) => handleRefresh(req, res, params.id));
-route('GET', '/dashboards/:id/errors', (req, res, { params }) => handleErrors(req, res, params.id));
+// Live page operations: proxied to the open dashboard tab via the extension bridge.
+router.get('/dashboards/:id', (req, res, { params }) => handleDashboardGet(req, res, params.id));
+router.get('/dashboards/:id/pages', (req, res, { params }) => handlePages(req, res, params.id));
+router.post('/dashboards/:id/selectPage', (req, res, { params }) => handleSelectPage(req, res, params.id));
+router.post('/dashboards/:id/edit', (req, res, { params }) => handleEdit(req, res, params.id));
+router.post('/dashboards/:id/refresh', (req, res, { params }) => handleRefresh(req, res, params.id));
+router.get('/dashboards/:id/errors', (req, res, { params }) => handleErrors(req, res, params.id));
 
 // Lifecycle: move the working copy between the page, saved, and discarded.
-route('POST', '/dashboards/:id/pull', (req, res, { params }) => handlePull(req, res, params.id));
-route('POST', '/dashboards/:id/apply', (req, res, { params }) => handleApply(req, res, params.id));
-route('POST', '/dashboards/:id/discard', (req, res, { params }) => handleDiscard(req, res, params.id));
+router.post('/dashboards/:id/pull', (req, res, { params }) => handlePull(req, res, params.id));
+router.post('/dashboards/:id/apply', (req, res, { params }) => handleApply(req, res, params.id));
+router.post('/dashboards/:id/discard', (req, res, { params }) => handleDiscard(req, res, params.id));
 
 // Typed read views over the working copy (never the raw normalized JSON).
-route('GET', '/dashboards/:id/summary', (req, res, { params }) => handleStoreRead(req, res, params.id, (d) => patch.dashboardSummary(d)));
-route('GET', '/dashboards/:id/page-list', (req, res, { params }) => handleStoreRead(req, res, params.id, (d) => patch.listPages(d)));
-route('GET', '/dashboards/:id/parameters', (req, res, { params }) => handleStoreRead(req, res, params.id, (d) => patch.getParameters(d)));
-route('GET', '/dashboards/:id/tiles', (req, res, { params, url }) => handleStoreRead(req, res, params.id, (d) => patch.listTiles(d, url.searchParams.get('pageId'))));
-route('GET', '/dashboards/:id/tiles/:tileId', (req, res, { params }) => handleStoreRead(req, res, params.id, (d) => patch.getTile(d, params.tileId)));
-route('GET', '/dashboards/:id/tiles/:tileId/query', (req, res, { params }) => handleStoreRead(req, res, params.id, (d) => patch.getQuery(d, params.tileId)));
+router.get('/dashboards/:id/summary', (req, res, { params }) => handleStoreRead(req, res, params.id, (d) => patch.dashboardSummary(d)));
+router.get('/dashboards/:id/page-list', (req, res, { params }) => handleStoreRead(req, res, params.id, (d) => patch.listPages(d)));
+router.get('/dashboards/:id/parameters', (req, res, { params }) => handleStoreRead(req, res, params.id, (d) => patch.getParameters(d)));
+router.get('/dashboards/:id/tiles', (req, res, { params, url }) => handleStoreRead(req, res, params.id, (d) => patch.listTiles(d, url.searchParams.get('pageId'))));
+router.get('/dashboards/:id/tiles/:tileId', (req, res, { params }) => handleStoreRead(req, res, params.id, (d) => patch.getTile(d, params.tileId)));
+router.get('/dashboards/:id/tiles/:tileId/query', (req, res, { params }) => handleStoreRead(req, res, params.id, (d) => patch.getQuery(d, params.tileId)));
 
 // Typed element writes against the working copy, one route per mutator.
-for (const [sub, fn] of Object.entries(STORE_WRITE_ROUTES)) {
-  route('POST', `/dashboards/:id/${sub}`, (req, res, { params }) => handleStorePatch(req, res, params.id, fn));
+const DASHBOARD_STORE_ROUTES = {
+  'set-query': (dash, body) => patch.setQuery(dash, body),
+  'set-query-datasource': (dash, body) => patch.setQueryDatasource(dash, body),
+  'set-tile': (dash, body) => patch.setTile(dash, body),
+  'set-layout': (dash, body) => patch.setLayout(dash, body),
+  'add-tile': (dash, body) => patch.addTile(dash, body),
+  'remove-tile': (dash, body) => patch.removeTile(dash, body),
+  'set-parameter': (dash, body) => patch.setParameter(dash, body),
+  'add-parameter': (dash, body) => patch.addParameter(dash, body),
+  'remove-parameter': (dash, body) => patch.removeParameter(dash, body),
+  'rename-page': (dash, body) => patch.renamePage(dash, body)
+};
+for (const [sub, fn] of Object.entries(DASHBOARD_STORE_ROUTES)) {
+  router.post(`/dashboards/:id/${sub}`, (req, res, { params }) => handleStorePatch(req, res, params.id, fn));
 }
 
 // Main server
@@ -954,7 +954,7 @@ const server = http.createServer(async (req, res) => {
     return handleCors(req, res);
   }
 
-  const match = matchRoute(req.method, url.pathname);
+  const match = router.match(req.method, url.pathname);
   if (!match) {
     return sendJson(res, { error: 'Not found' }, 404);
   }

@@ -32,16 +32,15 @@ Add this stdio server to your MCP client config:
 ```json
 {
   "mcpServers": {
-    "adx-live-edit": {
+    "adx-dashboard": {
       "command": "npx",
-      "args": ["-y", "adx-live-edit-mcp"]
+      "args": ["-y", "adx-dashboard-mcp"]
     }
   }
 }
 ```
 
-The daemon is started automatically by the MCP server on first use. Cold start takes about
-20 seconds.
+The daemon is started automatically by the MCP server on first use.
 
 ## Development
 
@@ -51,18 +50,3 @@ npm start          # run the MCP server over stdio
 npm run daemon     # run the daemon directly (normally auto-started)
 npm test           # run the unit tests
 ```
-
-## Tools
-
-The full v1 surface is implemented: 22 tools (8 read, 10 write, 4 lifecycle).
-
-- **Read**: `list_dashboards`, `get_dashboard_summary`, `list_pages`, `list_tiles`,
-  `get_tile`, `get_query`, `get_parameters`, `get_schema`.
-- **Write**: `set_query`, `set_query_datasource`, `set_tile`, `set_layout`, `add_tile`,
-  `remove_tile`, `set_parameter`, `add_parameter`, `remove_parameter`, `rename_page`.
-- **Lifecycle**: `apply`, `get_errors`, `discard`, `refresh`.
-
-Writes mutate a daemon-held working copy and are schema-validated before they return.
-`apply` pushes the working copy to the browser and blocks on your approval. See
-[docs/design.md](docs/design.md) for the data model the tools hide and the
-`usedVariables` rule, plus the v1 implementation notes at the end.

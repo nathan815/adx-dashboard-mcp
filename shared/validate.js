@@ -3,11 +3,8 @@
 /*
  * Validate an ADX dashboard JSON object against the official ADX dashboard schema.
  *
- * Migrated from the adx-dashboard-authoring skill (scripts/validate.js) and converted
- * from CommonJS to ESM. Validation behavior is intentionally identical to the original.
- * The one change from the migration baseline is the cache location: the schema graph now
- * lands under a stable home directory (cacheRoot) instead of the repo root, so it survives
- * across npx runs where the cwd is a throwaway temp dir.
+ * The schema graph is cached under a stable home directory (cacheRoot) rather than the
+ * repo root, so it survives across npx runs where the cwd is a throwaway temp dir.
  */
 
 import fs from 'node:fs';

@@ -8,7 +8,7 @@
 // We use node:http rather than global fetch on purpose. fetch (undici) keeps
 // pooled sockets alive and a later process exit can crash libuv with an
 // assertion on Windows. For a localhost-only client, http.request gives clean,
-// prompt teardown. This mirrors the old client.js decision.
+// prompt teardown.
 
 import http from 'node:http';
 import fs from 'node:fs';

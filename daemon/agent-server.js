@@ -7,10 +7,6 @@
  * The only third-party dependency is the validator (ajv), and it is loaded
  * lazily so read-only commands work even before `npm install`.
  *
- * Migrated from the adx-dashboard-live-edit skill (chrome-extension/agent-server.js)
- * and converted from CommonJS to ESM. Behavior is unchanged in this baseline; the
- * stateful backend (disk store, element patches) is layered on in later phases.
- *
  * Usage:
  *     node agent-server.js [--port 9876]
  *
@@ -33,12 +29,6 @@ const EDIT_TIMEOUT_MS = 120000;
 const GET_TIMEOUT_MS = 10000;
 const ACTION_TIMEOUT_MS = 10000;
 const POLL_TIMEOUT_MS = 30000;
-
-// Server-side validation is the authoritative gate: even if an agent bypasses
-// client.js and POSTs raw JSON, a malformed dashboard never reaches the browser.
-// ADX_SKIP_VALIDATION=1 is a deliberate escape hatch for the rare case where
-// ADX's own published schema is wrong; it disables this gate.
-const SKIP_VALIDATION = process.env.ADX_SKIP_VALIDATION === '1';
 
 // Maps a POST subpath under /dashboards/:id to the element-level mutator that applies
 // it to the working copy. Keeping it data-driven means the router stays small and every
@@ -201,13 +191,12 @@ function removeInstance(dashboardId, instanceId) {
 // invalid or the validator could not run, or null when it passes. Shared by /edit,
 // store patches, and apply so they all gate on the same authoritative check.
 async function validateOrProblem(dashboard) {
-  if (SKIP_VALIDATION) return null;
   const { fn, err } = await getValidator();
   if (err) {
     return { status: 500, body: {
       error: 'Validation could not run on the server',
       detail: err.message,
-      hint: 'Run `npm install` so the validator (ajv) is available, or set ADX_SKIP_VALIDATION=1 to bypass.'
+      hint: 'Run `npm install` so the validator (ajv) is available.'
     } };
   }
   let validation;

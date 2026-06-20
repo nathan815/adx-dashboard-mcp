@@ -1,26 +1,37 @@
 # ADX Dashboard Live-Edit MCP Server - Design
 
-This is the canonical design reference for `adx-live-edit-mcp`. It is adapted from the
-signed-off design plan and describes the architecture, the data model the tools hide, the
-full v1 tool surface, and the `usedVariables` invariant.
-
-## Goal
-
-Replace the `adx-dashboard-live-edit` skill (a `client.js` CLI plus SKILL.md instructions)
-with a stdio MCP server that exposes typed, schema-driven tools. Move the invariants the
-agent kept missing (e.g. `usedVariables`) and the bookkeeping the agent did ad-hoc (edit
-buffer, schema files, downloaded dashboards) out of the agent's head and into server code.
-
 ## Why
 
-The skill-based approach failed structurally. A SKILL.md can only ask the agent to remember a
-rule, and under compaction it forgets. The clearest example is the `usedVariables` failure: an
-agent injected `_startTime`/`_endTime` into several query texts, the tiles errored with
-`Failed to resolve scalar expression named '_startTime'`, and it burned roughly 16 tool calls
-and 4 wrong hypotheses before discovering that a query only binds the variables listed in its
-`usedVariables` array. A typed tool makes that rule part of the interface instead of a note in
-a doc. The same session also did about 24 inline `node -e` JSON-surgery calls maintaining an
-`edit.json` by hand, which the daemon-hosted working copy eliminates.
+Azure Data Explorer dashboards are normally authored by hand in the browser: clicking through
+tile editors, parameter dialogs, and query panes. That is slow for bulk or repetitive changes
+(renaming parameters across many tiles, adjusting a shared query, restructuring a page) and it
+gives an AI agent no way to help, because there is no public write API for a dashboard and the
+edits only exist in the browser's in-memory state until the user saves.
+
+This project bridges that gap. A Chrome extension owns the live dashboard in the page, a local
+daemon holds the working copy and brokers approval, and an MCP server gives an agent a typed,
+validated way to read and change a dashboard that is open in front of the user. The agent can
+make a change, the daemon validates it against the ADX schema, and the user approves before
+anything is pushed back into the browser. The result is conversational dashboard editing on a
+real, live dashboard without the agent ever touching the raw dashboard JSON or saving on the
+user's behalf.
+
+## Why an MCP server, not a skill
+
+A prior version of this shipped as a skill: a `client.js` CLI plus a skill instruction document.
+That approach fails structurally. A skill document can only ask the calling agent to remember a
+rule, and the rule is dropped as soon as the relevant instructions fall out of context. The
+clearest example is the `usedVariables` invariant. A query only binds the parameter variables
+listed in its `usedVariables` array, so injecting a variable into the query text without adding
+it to that array makes the tile fail at render time with
+`Failed to resolve scalar expression named '...'`. A prose rule does not prevent this; a typed
+tool that requires `usedVariables` as an explicit input does, because the rule becomes part of
+the interface rather than a note the caller has to recall.
+
+The normalized JSON is the second structural problem. Editing it by hand means walking
+references (tile to query to data source) and patching a large document in place, which is error
+prone and easy to get subtly wrong. A daemon-hosted working copy plus element-level typed tools
+removes the raw JSON surgery entirely.
 
 ## Architecture
 
@@ -99,17 +110,19 @@ Daemon-backed, on disk, under a cache root
 - `schema/<schema_version>.json` - fetched once per schema version, reused across all sessions.
   Backs `get_schema` and every server-side validation.
 - `dashboards/<id>/saved.json` - last fetched saved dashboard.
-- `dashboards/<id>/working.json` - the edit buffer. `set_*` tools mutate this; `apply` pushes it
-  to the browser.
+- `dashboards/<id>/working.json` - the edit buffer. On first access of a dashboard the daemon
+  pulls the current saved JSON from the page into `saved.json` and copies it to `working.json`;
+  the read tools trigger this pull automatically. `set_*` tools mutate `working.json`; `apply`
+  pushes it to the browser.
 
-This eliminates the repeated 1MB `get` into agent context, the hand-maintained `edit.json`, and
-the get-vs-errors confusion (one authoritative working copy instead of "saved JSON" versus
-"browser in-memory edited state").
+This removes the repeated large `get` into caller context, the hand-maintained edit buffer, and
+the ambiguity between saved JSON and the browser's in-memory edited state. There is one
+authoritative working copy.
 
 ## Data model the tools hide (schema v76)
 
-The dashboard JSON is normalized, and that normalization is the single biggest source of the
-agent's ad-hoc surgery. The typed tools exist to hide it.
+The dashboard JSON is normalized, and that normalization is the single biggest source of
+error-prone manual editing. The typed tools exist to hide it.
 
 - A tile does not contain its KQL. `tiles[]` entries carry `id, title, layout, pageId,
   visualType, visualOptions` and a `queryRef` (`{kind:"query", queryId}` or
@@ -140,77 +153,62 @@ shape; JSON-schema does not), so the tools validate the tile envelope strictly b
 
 ## Tool surface (schema-driven)
 
-Notation: **req** = required input, opt = optional. Every write mutates `working.json` and runs
-full schema validation before returning. A write that would make the dashboard invalid is
-rejected and the working copy is left untouched.
+Every write mutates `working.json` and runs full schema validation before returning. A write
+that would make the dashboard invalid is rejected and the working copy is left untouched.
+Required inputs are shown without a `?`; optional inputs carry a trailing `?`.
+
+The typed input shapes (visual types, parameter kinds, refresh intervals) use curated static
+enums for schema v76 rather than shapes derived from a live schema fetch at startup. Deriving
+them at tool-registration time would force the daemon's roughly 20 second cold start during
+`tools/list` and break instant tool listing. The daemon still validates every write against the
+cached schema with ajv, which is the real gate; the static enums only shape the inputs the
+caller sees.
 
 ### Read (cheap, scoped)
 
-- `list_dashboards()` -> `[{id, title}]`. Backed by the management API plus cache.
-- `get_dashboard_summary(dashboardId)` -> pages `[{id, name}]`, tiles `[{id, title, visualType,
-  pageId, layout, queryId, hasQuery}]`, parameters `[{id, displayName, kind, variableName(s),
-  selectionType}]`, `schema_version`. No KQL bodies, no visualOptions. This is the map the agent
-  reads instead of the 1MB blob.
-- `list_pages(dashboardId)` -> `[{id, name}]`.
-- `list_tiles(dashboardId, pageId?)` -> `[{id, title, visualType, pageId, layout, queryId,
-  hasQuery}]`, optionally filtered to one page.
-- `get_tile(dashboardId, tileId)` -> the one full tile object plus its resolved query
-  (`{text, usedVariables, dataSource}`) inlined.
-- `get_query(dashboardId, tileId)` -> just `{queryId, text, usedVariables, dataSource}`.
-- `get_parameters(dashboardId)` -> full parameter list (kinds, variable names, defaults, data
-  sources).
-- `get_schema(schemaVersion?, file?)` -> cached schema. `file` selects one of the schema files
-  (`tile`, `query`, `parameter`, ...) so the agent can pull just `tile.json`. Defaults to the
-  dashboard's `schema_version`.
+| Tool | Returns |
+| --- | --- |
+| `list_dashboards()` | `[{id, title}]` for dashboards with a live connected tab. Listing dashboards without an open tab is a possible later addition. |
+| `get_dashboard_summary(dashboardId)` | pages `[{id, name}]`, tiles `[{id, title, visualType, pageId, layout, queryId, hasQuery}]`, parameters `[{id, displayName, kind, variableName(s), selectionType}]`, `schema_version`. No KQL bodies or visualOptions. The map a caller reads instead of the full dashboard blob. |
+| `list_pages(dashboardId)` | `[{id, name}]`. |
+| `list_tiles(dashboardId, pageId?)` | `[{id, title, visualType, pageId, layout, queryId, hasQuery}]`, optionally filtered to one page. |
+| `get_tile(dashboardId, tileId)` | the full tile object plus its resolved query (`{text, usedVariables, dataSource}`) inlined. |
+| `get_query(dashboardId, tileId)` | `{queryId, text, usedVariables, dataSource}`. |
+| `get_parameters(dashboardId)` | full parameter list (kinds, variable names, defaults, data sources). |
+| `get_schema(schemaVersion?, file?)` | cached schema. `file` selects one schema file (`tile.json`, `query.json`, `parameter.json`, ...); omit it for the whole `{filename: schema}` graph. `schemaVersion` defaults to 76. |
+| `get_schema_for_dashboard(dashboardId, file?)` | cached schema at the version the dashboard actually uses. Resolves `schema_version` server-side so the caller never passes it, then returns `{dashboardId, schemaVersion, file, schema}`. The safe choice for a known dashboard. |
 
 ### Write (typed; resolve refs; mutate working copy; validate every call)
 
-- `set_query(dashboardId, tileId, text, usedVariables)` - **req** all four. Resolves the tile's
-  `queryRef`, rewrites that query's `text` and `usedVariables`. See the usedVariables rule below.
-  Returns the updated `{queryId, usedVariables}` and any lint warnings.
-- `set_query_datasource(dashboardId, tileId, dataSourceId)` - **req**. Repoints the tile's query
-  at a different entry in `dataSources[]`. Validates the id exists.
-- `set_tile(dashboardId, tileId, {title?, hideTitle?, description?, layout?, visualType?,
-  visualOptions?})` - tileId **req**, every field opt (patch semantics). The envelope is
-  schema-validated. If `visualType` changes to/from `markdownCard`, the tool enforces the
-  queryRef presence/absence rule and errors with guidance rather than silently corrupting.
-- `set_layout(dashboardId, tileId, {x, y, width, height})` - **req** tileId plus at least one of
-  x/y/width/height (patch). Split out from `set_tile` because moving/resizing is the most common
-  cosmetic edit. Validates bounds (`width>=2`, `height>=1`, `x,y>=0`).
-- `add_tile(dashboardId, {pageId, visualType, title, layout, query?, visualOptions?})` - creates
-  the tile and, for non-markdown visuals, the backing `queries[]` entry in one call
-  (`query` = `{text, usedVariables, dataSourceId}`). Generates the uuids and the `queryRef`
-  wiring. `markdownCard` skips the query. Returns the new `tileId` (plus `queryId`).
-- `remove_tile(dashboardId, tileId)` - removes the tile and garbage-collects its query if no
-  other tile/parameter references it.
-- `set_parameter(dashboardId, parameterId, {...})` - typed per `kind`
-  (`string|int|long|real|decimal|bool|datetime|duration|dataSource`). The tool knows each kind's
-  required fields from `parameter.json` (e.g. `duration` needs `beginVariableName` /
-  `endVariableName` plus a `dynamic|fixed` default; query-backed `scalar`/`array` need
-  `includeAllOption` plus a `dataSource`). Renaming a parameter's variable name flags every query
-  whose `usedVariables` references the old name.
-- `add_parameter` / `remove_parameter` - same kind-aware shaping. `remove_parameter` warns if any
-  query still lists its variable in `usedVariables`.
-- `rename_page(dashboardId, pageId, name)` - **req**.
+| Tool | Behavior |
+| --- | --- |
+| `set_query(dashboardId, tileId, text, usedVariables)` | Resolves the tile's `queryRef`, rewrites that query's `text` and `usedVariables` (see the usedVariables rule below). Returns `{queryId, usedVariables}` and any lint warnings. |
+| `set_query_datasource(dashboardId, tileId, dataSourceId)` | Repoints the tile's query at a different entry in `dataSources[]`. Validates the id exists. |
+| `set_tile(dashboardId, tileId, {title?, hideTitle?, description?, layout?, visualType?, visualOptions?, markdownText?})` | Patch semantics; the envelope is schema-validated. `markdownText` sets the body of a `markdownCard` tile. Changing `visualType` to/from `markdownCard` enforces the queryRef presence/absence rule and errors with guidance rather than silently corrupting. |
+| `set_layout(dashboardId, tileId, {x?, y?, width?, height?})` | At least one of x/y/width/height required (patch). Validates bounds (`width>=2`, `height>=1`, `x,y>=0`). Split from `set_tile` because moving/resizing is the most common cosmetic edit. |
+| `add_tile(dashboardId, {pageId, visualType, title, layout, query?, visualOptions?})` | Creates the tile and, for non-markdown visuals, the backing `queries[]` entry in one call (`query = {text, usedVariables, dataSourceId}`). Generates the uuids and queryRef wiring. `markdownCard` skips the query. Returns the new `tileId` (plus `queryId`). |
+| `remove_tile(dashboardId, tileId)` | Removes the tile and garbage-collects its query if no other tile/parameter references it. |
+| `set_parameter(dashboardId, parameterId, patch)` | Merges the patch and validates against `parameter.json`, which carries the per-kind required fields (`string|int|long|real|decimal|bool|datetime|duration|dataSource`; e.g. `duration` needs `beginVariableName`/`endVariableName`, query-backed `scalar`/`array` need `includeAllOption` plus a `dataSource`). Renaming a variable name flags every query whose `usedVariables` references the old name. A per-kind typed input shape is a candidate refinement. |
+| `add_parameter` / `remove_parameter` | Same validation. `remove_parameter` warns if any query still lists its variable in `usedVariables`. |
+| `rename_page(dashboardId, pageId, name)` | Renames the page. |
 
 ### Lifecycle
 
-- `apply(dashboardId)` - push `working.json` to the browser, block on approval while emitting
-  progress ("Waiting for your approval on the ADX dashboard..."), then return `{applied,
-  tileErrors:[{tileId, message}]}`. Detect-and-refuse if the dashboard is open in more than one
-  tab.
-- `get_errors(dashboardId)` -> current `tileErrors` from the live render. Used after `apply` to
-  confirm a fix.
-- `discard(dashboardId)` - drop `working.json`, revert to `saved.json`.
-- `refresh(dashboardId)` - re-run the live dashboard's queries.
+| Tool | Behavior |
+| --- | --- |
+| `apply(dashboardId)` | Pushes `working.json` to the browser, blocks on approval while emitting progress ("Waiting for your approval on the ADX dashboard..."), then returns `{applied, tileErrors:[{tileId, message}]}`. Detect-and-refuse if the dashboard is open in more than one tab. |
+| `get_errors(dashboardId)` | Current `tileErrors` from the live render. Used after `apply` to confirm a fix. |
+| `discard(dashboardId)` | Drops `working.json`, reverts to `saved.json`. |
+| `refresh(dashboardId)` | Re-runs the live dashboard's queries. |
 
 ### Deferred to phase 2 (documented, not v1)
 
-- `diff(dashboardId)` -> a compact summary of working-vs-saved changes.
-- `list_open_tabs(dashboardId)` / `select_tab(instanceId)` - per-tab routing on top of the v1
-  `instanceId` plumbing.
-- `add_page` / `remove_page` - page creation/removal.
-- `move_tile_to_page` - convenience wrapper over `set_tile(pageId)`.
+| Tool | Purpose |
+| --- | --- |
+| `diff(dashboardId)` | A compact summary of working-vs-saved changes. |
+| `list_open_tabs(dashboardId)` / `select_tab(instanceId)` | Per-tab routing on top of the v1 `instanceId` plumbing. |
+| `add_page` / `remove_page` | Page creation/removal. |
+| `move_tile_to_page` | Convenience wrapper over `set_tile(pageId)`. |
 
 ## usedVariables rule (explicit, not derived)
 
@@ -229,62 +227,5 @@ negatives on non-prefixed vars, false positives on columns and `let` bindings). 
    parameter variables listed in usedVariables. List every dashboard parameter referenced by
    queryText."
 
-Four layers (required field, validation, lint, inline description) that a SKILL.md cannot
+Four layers (required field, validation, lint, inline description) that a prose rule cannot
 enforce, only request.
-
-## What stays vs changes
-
-Stays: the extension, the daemon singleton plus browser/approval ownership, the ADX-schema
-validation logic, the per-dashboard approval model (12h TTL).
-
-Changes: `client.js` becomes a thin stdio MCP server. The daemon gains a schema cache, the
-dashboard saved/working store, element-level patch endpoints backing the typed tools, and the
-long-poll approval for a blocking `apply`. Authoring stays a separate offline skill and shares
-the `validate` logic.
-
-## Distribution
-
-Its own repo. MCP servers ship and version differently from skills (npm plus `npx`, an `mcp`
-config block, extension releases). Registration is one stdio config block:
-`command: npx, args: ["-y", "adx-live-edit-mcp"]`.
-
-## Phases
-
-1. Daemon backend: cache dir, schema cache, saved/working store, element-level patch endpoints
-   mutating `working.json`, `apply` that pushes `working.json`, long-poll approval.
-2. stdio MCP server scaffold (`@modelcontextprotocol/sdk`), tool-to-endpoint mapping, input
-   validation, blocking `apply` with progress notifications.
-3. Typed tools with schema-derived input shapes; `usedVariables` enforcement in `set_query`.
-4. Shared validation logic; repo plus distribution wiring.
-5. Retire/slim the old SKILL.md to a pointer; keep the authoring skill.
-
-## v1 implementation notes
-
-The full tool surface above is implemented and committed. A few things ship slightly
-differently from the design intent stated earlier in this document. They are recorded here so
-the doc matches what actually runs:
-
-- **No `pull` tool.** The design says the daemon pulls a working copy on first access. The
-  daemon returns `409 no_working_copy` instead, so the read tools wrap a `withAutoPull` helper
-  that catches that 409, calls the daemon `pull` endpoint once, and retries. The net behavior
-  matches "pulls on first access"; there is just no agent-visible `pull`.
-- **`list_dashboards` returns connected tabs, not a management-API catalog.** It lists the
-  dashboards that currently have a live browser tab connected to the daemon, not every dashboard
-  the user could open. Listing dashboards without an open tab is a possible later addition.
-- **`get_schema` has no dashboard context.** It takes an optional `file` (omit for the whole
-  schema graph) and a `version` that defaults to 76, rather than defaulting to a specific
-  dashboard's `schema_version`. All current dashboards are v76, so this is equivalent in
-  practice.
-- **Typed input shapes use curated static v76 enums**, not shapes derived from a live schema
-  fetch. Deriving them at tool-registration time would trigger the ~20 second daemon cold start
-  during `tools/list` and break instant listing. The daemon still ajv-validates every write
-  against the cached schema, which is the real gate.
-- **`set_tile` accepts `markdownText`** (markdown tiles need a way to set their text) even though
-  the field list earlier in this doc omitted it.
-- **`set_parameter` takes a flat `patch` object**, not a per-kind typed shape. The daemon
-  ajv-validates the merged parameter against `parameter.json`. Per-kind typed parameter editing
-  is a candidate refinement.
-- **`usedVariables` accept/reject is covered by unit tests, not a headless stdio round-trip.**
-  The patch endpoints need a working copy pulled from a live browser tab, so without a connected
-  tab `set_query` fails at the pull step before the `usedVariables` check runs. The accept/reject
-  logic is exercised directly by the patch unit tests.

@@ -1,4 +1,4 @@
-# adx-live-edit-mcp
+# adx-dashboard-mcp
 
 A stdio MCP server for live-editing Azure Data Explorer (ADX) dashboards that are open in a
 browser tab. It exposes typed, schema-driven tools so an agent can read and edit dashboard

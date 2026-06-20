@@ -905,88 +905,82 @@ function handleCors(req, res) {
   res.end();
 }
 
+// Minimal express-style router. A pattern like '/dashboards/:id/tiles/:tileId'
+// compiles to a regex; the :segments are captured, decoded, and handed to the
+// handler as ctx.params. Routes are matched in registration order, first hit wins.
+const routes = [];
+function route(method, pattern, handler) {
+  const keys = [];
+  const regex = new RegExp('^' + pattern.replace(/:[^/]+/g, (m) => {
+    keys.push(m.slice(1));
+    return '([^/]+)';
+  }) + '$');
+  routes.push({ method, regex, keys, handler });
+}
+
+function matchRoute(method, pathname) {
+  for (const r of routes) {
+    if (r.method !== method) continue;
+    const m = pathname.match(r.regex);
+    if (!m) continue;
+    const params = {};
+    r.keys.forEach((k, i) => { params[k] = decodeURIComponent(m[i + 1]); });
+    return { handler: r.handler, params };
+  }
+  return null;
+}
+
+// Top-level endpoints.
+route('GET', '/status', handleStatus);
+route('GET', '/dashboards', handleDashboards);
+route('GET', '/schema', handleSchema);
+route('POST', '/connect', handleConnect);
+route('POST', '/disconnect', handleDisconnect);
+route('GET', '/poll', handlePoll);
+route('POST', '/result', handleResult);
+
+// Browser-facing dashboard routes (the extension talks to these).
+route('GET', '/dashboards/:id', (req, res, { params }) => handleDashboardGet(req, res, params.id));
+route('GET', '/dashboards/:id/pages', (req, res, { params }) => handlePages(req, res, params.id));
+route('POST', '/dashboards/:id/selectPage', (req, res, { params }) => handleSelectPage(req, res, params.id));
+route('POST', '/dashboards/:id/edit', (req, res, { params }) => handleEdit(req, res, params.id));
+route('POST', '/dashboards/:id/refresh', (req, res, { params }) => handleRefresh(req, res, params.id));
+route('GET', '/dashboards/:id/errors', (req, res, { params }) => handleErrors(req, res, params.id));
+
+// Lifecycle: move the working copy between the page, saved, and discarded.
+route('POST', '/dashboards/:id/pull', (req, res, { params }) => handlePull(req, res, params.id));
+route('POST', '/dashboards/:id/apply', (req, res, { params }) => handleApply(req, res, params.id));
+route('POST', '/dashboards/:id/discard', (req, res, { params }) => handleDiscard(req, res, params.id));
+
+// Typed read views over the working copy (never the raw normalized JSON).
+route('GET', '/dashboards/:id/summary', (req, res, { params }) => handleStoreRead(req, res, params.id, (d) => patch.dashboardSummary(d)));
+route('GET', '/dashboards/:id/page-list', (req, res, { params }) => handleStoreRead(req, res, params.id, (d) => patch.listPages(d)));
+route('GET', '/dashboards/:id/parameters', (req, res, { params }) => handleStoreRead(req, res, params.id, (d) => patch.getParameters(d)));
+route('GET', '/dashboards/:id/tiles', (req, res, { params, url }) => handleStoreRead(req, res, params.id, (d) => patch.listTiles(d, url.searchParams.get('pageId'))));
+route('GET', '/dashboards/:id/tiles/:tileId', (req, res, { params }) => handleStoreRead(req, res, params.id, (d) => patch.getTile(d, params.tileId)));
+route('GET', '/dashboards/:id/tiles/:tileId/query', (req, res, { params }) => handleStoreRead(req, res, params.id, (d) => patch.getQuery(d, params.tileId)));
+
+// Typed element writes against the working copy, one route per mutator.
+for (const [sub, fn] of Object.entries(STORE_WRITE_ROUTES)) {
+  route('POST', `/dashboards/:id/${sub}`, (req, res, { params }) => handleStorePatch(req, res, params.id, fn));
+}
+
 // Main server
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://localhost:${PORT}`);
-  const path = url.pathname;
 
   // CORS preflight
   if (req.method === 'OPTIONS') {
     return handleCors(req, res);
   }
 
-  // Parse RESTful dashboard routes: /dashboards/:id/...
-  const dashboardMatch = path.match(/^\/dashboards\/([^/]+)(\/(.+))?$/);
+  const match = matchRoute(req.method, url.pathname);
+  if (!match) {
+    return sendJson(res, { error: 'Not found' }, 404);
+  }
 
   try {
-    if (path === '/status' && req.method === 'GET') {
-      await handleStatus(req, res);
-    } else if (path === '/dashboards' && req.method === 'GET') {
-      await handleDashboards(req, res);
-    } else if (path === '/schema' && req.method === 'GET') {
-      await handleSchema(req, res);
-    } else if (dashboardMatch) {
-      const dashboardId = dashboardMatch[1];
-      const subPath = dashboardMatch[3] || '';
-      const segs = subPath ? subPath.split('/') : [];
-      const method = req.method;
-
-      // Browser-facing routes (the extension talks to these). Keep them as-is.
-      if (!subPath && method === 'GET') {
-        await handleDashboardGet(req, res, dashboardId);
-      } else if (subPath === 'pages' && method === 'GET') {
-        await handlePages(req, res, dashboardId);
-      } else if (subPath === 'selectPage' && method === 'POST') {
-        await handleSelectPage(req, res, dashboardId);
-      } else if (subPath === 'edit' && method === 'POST') {
-        await handleEdit(req, res, dashboardId);
-      } else if (subPath === 'refresh' && method === 'POST') {
-        await handleRefresh(req, res, dashboardId);
-      } else if (subPath === 'errors' && method === 'GET') {
-        await handleErrors(req, res, dashboardId);
-
-      // Lifecycle: move the working copy between the page, saved, and discarded.
-      } else if (subPath === 'pull' && method === 'POST') {
-        await handlePull(req, res, dashboardId);
-      } else if (subPath === 'apply' && method === 'POST') {
-        await handleApply(req, res, dashboardId);
-      } else if (subPath === 'discard' && method === 'POST') {
-        await handleDiscard(req, res, dashboardId);
-
-      // Typed read views over the working copy (never the raw normalized JSON).
-      } else if (subPath === 'summary' && method === 'GET') {
-        await handleStoreRead(req, res, dashboardId, (d) => patch.dashboardSummary(d));
-      } else if (subPath === 'page-list' && method === 'GET') {
-        await handleStoreRead(req, res, dashboardId, (d) => patch.listPages(d));
-      } else if (subPath === 'parameters' && method === 'GET') {
-        await handleStoreRead(req, res, dashboardId, (d) => patch.getParameters(d));
-      } else if (segs[0] === 'tiles' && segs.length === 1 && method === 'GET') {
-        const pageId = url.searchParams.get('pageId');
-        await handleStoreRead(req, res, dashboardId, (d) => patch.listTiles(d, pageId));
-      } else if (segs[0] === 'tiles' && segs.length === 2 && method === 'GET') {
-        const tileId = decodeURIComponent(segs[1]);
-        await handleStoreRead(req, res, dashboardId, (d) => patch.getTile(d, tileId));
-      } else if (segs[0] === 'tiles' && segs.length === 3 && segs[2] === 'query' && method === 'GET') {
-        const tileId = decodeURIComponent(segs[1]);
-        await handleStoreRead(req, res, dashboardId, (d) => patch.getQuery(d, tileId));
-
-      // Typed element writes against the working copy.
-      } else if (method === 'POST' && STORE_WRITE_ROUTES[subPath]) {
-        await handleStorePatch(req, res, dashboardId, STORE_WRITE_ROUTES[subPath]);
-      } else {
-        sendJson(res, { error: 'Not found' }, 404);
-      }
-    } else if (path === '/connect' && req.method === 'POST') {
-      await handleConnect(req, res);
-    } else if (path === '/disconnect' && req.method === 'POST') {
-      await handleDisconnect(req, res);
-    } else if (path === '/poll' && req.method === 'GET') {
-      await handlePoll(req, res);
-    } else if (path === '/result' && req.method === 'POST') {
-      await handleResult(req, res);
-    } else {
-      sendJson(res, { error: 'Not found' }, 404);
-    }
+    await match.handler(req, res, { params: match.params, url });
   } catch (e) {
     console.error('Error handling request:', e);
     sendJson(res, { error: 'Internal server error' }, 500);

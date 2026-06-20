@@ -23,6 +23,7 @@ import { randomUUID } from 'node:crypto';
 import * as store from './store.js';
 import * as patch from './patch.js';
 import { DEFAULT_SCHEMA_VERSION } from '../shared/validate.js';
+import { createRouter } from './router.js';
 
 const PORT = parseInt(process.argv.find((_, i, a) => a[i-1] === '--port') || '9876');
 const EDIT_TIMEOUT_MS = 120000;
@@ -905,30 +906,9 @@ function handleCors(req, res) {
   res.end();
 }
 
-// Minimal express-style router. A pattern like '/dashboards/:id/tiles/:tileId'
-// compiles to a regex; the :segments are captured, decoded, and handed to the
-// handler as ctx.params. Routes are matched in registration order, first hit wins.
-const routes = [];
-function route(method, pattern, handler) {
-  const keys = [];
-  const regex = new RegExp('^' + pattern.replace(/:[^/]+/g, (m) => {
-    keys.push(m.slice(1));
-    return '([^/]+)';
-  }) + '$');
-  routes.push({ method, regex, keys, handler });
-}
-
-function matchRoute(method, pathname) {
-  for (const r of routes) {
-    if (r.method !== method) continue;
-    const m = pathname.match(r.regex);
-    if (!m) continue;
-    const params = {};
-    r.keys.forEach((k, i) => { params[k] = decodeURIComponent(m[i + 1]); });
-    return { handler: r.handler, params };
-  }
-  return null;
-}
+// Generic route registry lives in router.js; this file just registers the
+// daemon's endpoints against it.
+const { route, match: matchRoute } = createRouter();
 
 // Top-level endpoints.
 route('GET', '/status', handleStatus);

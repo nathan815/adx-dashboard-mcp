@@ -1,13 +1,8 @@
 # adx-dashboard-mcp
 
-A stdio MCP server for live-editing Azure Data Explorer (ADX) dashboards that are open in a
+A stdio MCP server + Chrome extension for live-editing Azure Data Explorer (ADX) dashboards that are open in a
 browser tab. It exposes typed, schema-driven tools so an agent can read and edit dashboard
-tiles, queries, and parameters without ever touching the normalized dashboard JSON by hand.
-
-It replaces the old `adx-dashboard-live-edit` skill (a `client.js` CLI plus SKILL.md rules)
-with server-enforced invariants. The most important one: a query only binds the parameter
-variables listed in its `usedVariables` array, so `set_query` requires that array explicitly
-and validates it.
+tiles, queries, and parameters while avoiding editing the normalized dashboard JSON manually.
 
 See [docs/design.md](docs/design.md) for the full architecture and tool surface.
 

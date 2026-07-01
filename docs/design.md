@@ -42,7 +42,7 @@ so the agent stops maintaining state.
 many ephemeral stdio MCP servers (per agent session)   <- thin front end
                  |  HTTP 127.0.0.1:9876
         one persistent daemon (singleton)               <- owns state below
-                 |
+                |  WebSocket ws://127.0.0.1:9876/extension
         Chrome/Edge extension  ->  ADX dashboard page
 ```
 
@@ -55,7 +55,8 @@ Responsibilities:
   approval grant (page localStorage, 12h TTL). It also owns the caches and the working copy.
   These must be a shared singleton because they outlive any one session and are co-located
   with the single browser connection.
-- **extension** (unchanged): injects into the page, applies edits, reports tile errors.
+- **extension**: injects into the page, keeps a WebSocket open to the daemon, applies edits,
+  and reports tile errors.
 
 The working copy (edit buffer) lives in the daemon, not the stdio server. It survives
 stdio-server restarts and compactions, is shared, and sits next to the browser connection that
@@ -71,25 +72,26 @@ call `process.exit()`. Daemon cold start is about 20 seconds.
 
 ## Multi-tab handling
 
-The real edit path is a poll-based broker keyed by dashboard id. Each tab's content script
-derives `dashboardId` from the URL, POSTs `/connect`, then long-polls `GET /poll?dashboardId=<id>`.
-The daemon only hands a queued command to a poll whose id matches (or `*`), and the content
-script re-checks and rejects on `Dashboard ID mismatch`. Approval is per-dashboardId in page
-localStorage, which is shared across same-origin tabs.
+The real edit path is a WebSocket broker keyed by dashboard id. Each tab's content script
+derives `dashboardId` from the URL, opens `ws://127.0.0.1:9876/extension`, and sends a
+`register` message with `dashboardId`, `instanceId`, title, and agent version. The daemon only
+sends a queued command to a socket whose dashboard id matches (or to any registered socket for
+`*`), and the content script re-checks and rejects on `Dashboard ID mismatch`. Approval is
+per-dashboardId in page localStorage, which is shared across same-origin tabs.
 
 Implications:
 
 - Different dashboards in different tabs (the common case): already correct. Commands for A only
-  reach the A poller. No user involvement needed.
-- Same dashboard in 2 or more tabs (the only real hazard): both tabs poll with the same id, so a
-  read is answered by whichever polls first and an edit applies in both tabs' in-memory models.
-  The final render/read and a save are nondeterministic between duplicate tabs, and two tabs
-  saving can clobber each other.
+  reach an A socket. No user involvement needed.
+- Same dashboard in 2 or more tabs (the only real hazard): both tabs register with the same id,
+  so a read is answered by whichever socket receives the command and an edit could target either
+  tab's in-memory model. The final render/read and a save are nondeterministic between duplicate
+  tabs, and two tabs saving can clobber each other.
 
 v1 design: detect-and-refuse on duplicate same-dashboard tabs.
 
 - The content script generates a stable per-tab `instanceId` (`crypto.randomUUID()` once per
-  load) and includes it in `/connect` and `/poll`.
+  load) and includes it in the WebSocket `register` message.
 - The daemon tracks `dashboardId -> [{instanceId, title, connectedAt}]` instead of collapsing by
   id.
 - When the MCP server is about to `apply`/write and sees more than one live instance for that id,
@@ -97,10 +99,9 @@ v1 design: detect-and-refuse on duplicate same-dashboard tabs.
   or tell me which to use." This makes the ambiguity structural and un-corruptable, the same
   spirit as the `usedVariables` fix.
 
-Future (documented, not v1): per-tab routing. The same `instanceId` plumbing supports
-`/poll?...&instanceId=I`, an optional target `instanceId` on queued commands, and
-`list_open_tabs` / `select_tab` tools. The v1 work builds the `instanceId` foundation and defers
-routing.
+Future (documented, not v1): per-tab routing. The same `instanceId` plumbing supports an
+optional target `instanceId` on queued commands and `list_open_tabs` / `select_tab` tools. The
+v1 work builds the `instanceId` foundation and defers routing.
 
 ## Caching
 
@@ -170,6 +171,7 @@ caller sees.
 | --- | --- |
 | `list_dashboards()` | `[{id, title}]` for dashboards with a live connected tab. Listing dashboards without an open tab is a possible later addition. |
 | `get_dashboard_summary(dashboardId)` | pages `[{id, name}]`, tiles `[{id, title, visualType, pageId, layout, queryId, hasQuery}]`, parameters `[{id, displayName, kind, variableName(s), selectionType}]`, `schema_version`. No KQL bodies or visualOptions. The map a caller reads instead of the full dashboard blob. |
+| `get_dashboard_json(dashboardId)` | Escape hatch: the full normalized dashboard JSON from the daemon working copy. Use typed read tools first because this can be large. |
 | `list_pages(dashboardId)` | `[{id, name}]`. |
 | `list_tiles(dashboardId, pageId?)` | `[{id, title, visualType, pageId, layout, queryId, hasQuery}]`, optionally filtered to one page. |
 | `get_tile(dashboardId, tileId)` | the full tile object plus its resolved query (`{text, usedVariables, dataSource}`) inlined. |
@@ -191,6 +193,7 @@ caller sees.
 | `set_parameter(dashboardId, parameterId, patch)` | Merges the patch and validates against `parameter.json`, which carries the per-kind required fields (`string|int|long|real|decimal|bool|datetime|duration|dataSource`; e.g. `duration` needs `beginVariableName`/`endVariableName`, query-backed `scalar`/`array` need `includeAllOption` plus a `dataSource`). Renaming a variable name flags every query whose `usedVariables` references the old name. A per-kind typed input shape is a candidate refinement. |
 | `add_parameter` / `remove_parameter` | Same validation. `remove_parameter` warns if any query still lists its variable in `usedVariables`. |
 | `rename_page(dashboardId, pageId, name)` | Renames the page. |
+| `set_dashboard_json(dashboardId, dashboard)` | Escape hatch: replaces the full daemon working copy with normalized dashboard JSON after full schema validation. Prefer typed tools when they can express the change; use this for gaps like page add/remove until dedicated tools exist. |
 
 ### Lifecycle
 

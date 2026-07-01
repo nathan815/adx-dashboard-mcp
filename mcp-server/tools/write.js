@@ -62,6 +62,23 @@ export function registerWriteTools(server) {
   );
 
   server.registerTool(
+    'set_dashboard_json',
+    {
+      title: 'Set dashboard JSON',
+      description:
+        'Escape hatch: replace the full dashboard working copy with normalized dashboard JSON. The daemon validates the full dashboard schema before saving. Prefer typed tools when they can express the change.',
+      inputSchema: {
+        dashboardId: z.string(),
+        dashboard: z.object({}).passthrough().describe('Full normalized dashboard JSON to save as the daemon working copy.'),
+      },
+    },
+    handler(async ({ dashboardId, dashboard }) => {
+      const body = await withAutoPull(dashboardId, () => daemon.setDashboardJson(dashboardId, dashboard));
+      return writeResult(body);
+    })
+  );
+
+  server.registerTool(
     'set_query_datasource',
     {
       title: 'Set query datasource',

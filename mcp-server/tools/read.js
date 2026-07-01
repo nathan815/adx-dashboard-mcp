@@ -37,6 +37,20 @@ export function registerReadTools(server) {
   );
 
   server.registerTool(
+    'get_dashboard_json',
+    {
+      title: 'Get dashboard JSON',
+      description:
+        'Escape hatch: return the full normalized dashboard JSON from the daemon working copy. Use typed read tools first when possible because this can be large.',
+      inputSchema: { dashboardId: z.string() },
+    },
+    handler(async ({ dashboardId }) => {
+      const body = await withAutoPull(dashboardId, () => daemon.getDashboardJson(dashboardId));
+      return jsonResult(body.result);
+    })
+  );
+
+  server.registerTool(
     'list_pages',
     {
       title: 'List pages',

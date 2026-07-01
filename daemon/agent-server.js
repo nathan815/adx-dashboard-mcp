@@ -2,10 +2,10 @@
 /**
  * ADX Dashboard Agent Server (Node.js)
  *
- * A simple HTTP server that bridges between AI agents and the Chrome extension.
- * Uses long polling for instant response without WebSocket dependencies.
- * The only third-party dependency is the validator (ajv), and it is loaded
- * lazily so read-only commands work even before `npm install`.
+ * A simple HTTP/WebSocket server that bridges between AI agents and the Chrome extension.
+ * The HTTP API is for MCP clients; the WebSocket bridge is for the browser extension.
+ * The validator (ajv) is loaded lazily so read-only commands work even before
+ * `npm install`.
  *
  * Usage:
  *     node agent-server.js [--port 9876]
@@ -13,23 +13,24 @@
  * API:
  *     POST /edit      - Submit dashboard edit (blocks until complete)
  *     GET  /dashboard - Get current dashboard JSON (blocks until received)
- *     GET  /poll      - Extension long-polls for commands
- *     POST /result    - Extension reports results
+ *     WS   /extension - Extension command bridge
  *     GET  /status    - Health check
  */
 
 import http from 'node:http';
-import { randomUUID } from 'node:crypto';
+import { WebSocketServer } from 'ws';
 import * as store from './store.js';
 import * as patch from './patch.js';
 import { DEFAULT_SCHEMA_VERSION } from '../shared/validate.js';
 import { createRouter } from './router.js';
+import { EXTENSION_ORIGIN, EXTENSION_WS_PATH, ExtensionBroker } from './extension-broker.js';
 
 const PORT = parseInt(process.argv.find((_, i, a) => a[i-1] === '--port') || '9876');
 const EDIT_TIMEOUT_MS = 120000;
 const GET_TIMEOUT_MS = 10000;
 const ACTION_TIMEOUT_MS = 10000;
-const POLL_TIMEOUT_MS = 30000;
+const VERIFY_APPLY_TIMEOUT_MS = 20000;
+const VERIFY_APPLY_INTERVAL_MS = 750;
 
 // Only the ADX dashboard page legitimately calls the daemon from a browser, and
 // that is the single origin the extension content script runs on. The MCP client
@@ -54,72 +55,15 @@ async function getValidator() {
   return { fn: _validateDashboard, err: _validatorLoadError };
 }
 
-// In-memory stores
-const pendingEdits = new Map();
-const pendingGets = new Map();
-const pendingActions = new Map();  // Generic actions (getPages, selectPage, etc.)
-const waitingPollers = [];  // Extension's long-poll requests
-// dashboardId -> Map(instanceId -> {instanceId, title, connectedAt}). Each browser tab
-// is its own instance so apply can refuse when more than one tab targets a dashboard.
-const connectedDashboards = new Map();
-
 function log(msg) {
   const time = new Date().toLocaleTimeString('en-US', { hour12: false });
   console.log(`[${time}] ${msg}`);
 }
 
-// Wake up any waiting pollers when a new command arrives
-function notifyPollers() {
-  while (waitingPollers.length > 0) {
-    const { res, dashboardId, timeout } = waitingPollers.shift();
-    clearTimeout(timeout);
-    handlePollResponse(res, dashboardId);
-  }
-}
+const broker = new ExtensionBroker({ log });
 
-function handlePollResponse(res, dashboardId) {
-  // Check for pending get requests first
-  for (const [id, get] of pendingGets) {
-    if (!get.result && (get.dashboardId === '*' || get.dashboardId === dashboardId)) {
-      sendJson(res, { pendingGet: { id, dashboardId: get.dashboardId } });
-      return;
-    }
-  }
-
-  // Check for pending actions (getPages, selectPage, etc.)
-  for (const [id, action] of pendingActions) {
-    if (!action.result && (action.dashboardId === '*' || action.dashboardId === dashboardId)) {
-      sendJson(res, {
-        pendingAction: {
-          id,
-          dashboardId: action.dashboardId,
-          type: action.type,
-          params: action.params
-        }
-      });
-      return;
-    }
-  }
-
-  // Check for pending edits
-  for (const [id, edit] of pendingEdits) {
-    if (!edit.result && (edit.dashboardId === '*' || edit.dashboardId === dashboardId)) {
-      sendJson(res, {
-        pendingEdit: {
-          id,
-          dashboardId: edit.dashboardId,
-          dashboard: edit.dashboard,
-          description: edit.description,
-          skipConfirmation: edit.skipConfirmation,
-          filename: edit.filename,
-          expiresAt: edit.expiresAt
-        }
-      });
-      return;
-    }
-  }
-
-  sendJson(res, { pendingEdit: null, pendingGet: null, pendingAction: null });
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function sendJson(res, data, status = 200) {
@@ -145,38 +89,6 @@ function parseBody(req) {
 }
 
 // --- Stateful backend helpers ----------------------------------------------------
-
-// Register or refresh one browser tab for a dashboard. Returns true when this is the
-// first time we have seen the instance.
-function touchInstance(dashboardId, instanceId, title, agentVersion) {
-  if (!dashboardId || !instanceId) return false;
-  let instances = connectedDashboards.get(dashboardId);
-  if (!instances) {
-    instances = new Map();
-    connectedDashboards.set(dashboardId, instances);
-  }
-  const prev = instances.get(instanceId);
-  instances.set(instanceId, {
-    instanceId,
-    title: title || (prev && prev.title) || 'Untitled',
-    agentVersion: agentVersion || (prev && prev.agentVersion) || null,
-    connectedAt: prev ? prev.connectedAt : Date.now()
-  });
-  return !prev;
-}
-
-function instancesFor(dashboardId) {
-  const instances = connectedDashboards.get(dashboardId);
-  return instances ? Array.from(instances.values()) : [];
-}
-
-function removeInstance(dashboardId, instanceId) {
-  const instances = connectedDashboards.get(dashboardId);
-  if (!instances) return;
-  if (instanceId) instances.delete(instanceId);
-  else instances.clear();
-  if (instances.size === 0) connectedDashboards.delete(dashboardId);
-}
 
 // Run the schema validator and return a problem ({status, body}) when the dashboard is
 // invalid or the validator could not run, or null when it passes. Shared by /edit,
@@ -211,56 +123,30 @@ async function validateOrProblem(dashboard) {
 }
 
 // Queue an edit for the page and block until the extension reports a result (or we time
-// out). Extracted from handleEdit so apply reuses the exact same approval/long-poll flow.
+// out). Extracted from handleEdit so apply reuses the exact same approval/WebSocket flow.
 async function queueEditAndWait(dashboardId, dashboard, opts = {}) {
-  const editId = randomUUID();
-  const edit = {
-    id: editId,
-    dashboardId,
+  const payload = {
     dashboard,
     description: opts.description || 'Agent edit',
     skipConfirmation: opts.skipConfirmation || false,
     filename: opts.filename || 'agent-edit.json',
-    createdAt: Date.now(),
     expiresAt: Date.now() + EDIT_TIMEOUT_MS,
-    result: null,
-    resolve: null
   };
-
-  const resultPromise = new Promise((resolve) => { edit.resolve = resolve; });
-  pendingEdits.set(editId, edit);
-  log(`Edit queued: ${editId} for dashboard ${dashboardId}`);
-  notifyPollers();
-
-  const timeoutPromise = new Promise((resolve) =>
-    setTimeout(() => resolve({ timeout: true }), EDIT_TIMEOUT_MS)
-  );
-  const result = await Promise.race([resultPromise, timeoutPromise]);
-  pendingEdits.delete(editId);
-  return { editId, result };
+  const { commandId, result } = await broker.queueCommand(dashboardId, 'edit', payload, EDIT_TIMEOUT_MS);
+  log(`Edit queued: ${commandId} for dashboard ${dashboardId}`);
+  return { editId: commandId, result };
 }
 
 // Ask the page for its current dashboard JSON and block until it answers (or times out).
 // Returns the page result ({ dashboard, title, meta, selectedPageId }) or { timeout: true }.
 async function requestDashboardFromPage(dashboardId) {
-  const getId = randomUUID();
-  const get = {
-    id: getId,
-    dashboardId: dashboardId || '*',
-    createdAt: Date.now(),
-    result: null,
-    resolve: null
-  };
-  const resultPromise = new Promise((resolve) => { get.resolve = resolve; });
-  pendingGets.set(getId, get);
-  log(`Get queued: ${getId} for dashboard ${get.dashboardId}`);
-  notifyPollers();
+  const { commandId, result } = await broker.queueCommand(dashboardId || '*', 'getDashboard', {}, GET_TIMEOUT_MS);
+  log(`Get queued: ${commandId} for dashboard ${dashboardId || '*'}`);
+  return result;
+}
 
-  const timeoutPromise = new Promise((resolve) =>
-    setTimeout(() => resolve({ timeout: true }), GET_TIMEOUT_MS)
-  );
-  const result = await Promise.race([resultPromise, timeoutPromise]);
-  pendingGets.delete(getId);
+async function requestActionFromPage(dashboardId, type, params = {}) {
+  const { result } = await broker.queueCommand(dashboardId || '*', 'action', { type, params }, ACTION_TIMEOUT_MS);
   return result;
 }
 
@@ -283,10 +169,20 @@ function stableStringify(value) {
 // Because every apply carries a unique change, the live state can only match the
 // working copy if the edit truly landed, so this can overturn a false negative
 // but never invent a false success. Returns true when verified applied.
-async function verifyAppliedAgainstPage(dashboardId, workingDash) {
-  const page = await requestDashboardFromPage(dashboardId);
-  if (!page || page.timeout || page.error || !page.dashboard) return false;
-  return stableStringify(page.dashboard) === stableStringify(workingDash);
+async function verifyAppliedAgainstPage(dashboardId, workingDash, timeoutMs = VERIFY_APPLY_TIMEOUT_MS) {
+  const expected = stableStringify(workingDash);
+  const deadline = Date.now() + timeoutMs;
+
+  while (Date.now() < deadline) {
+    const page = await requestDashboardFromPage(dashboardId);
+    if (page && !page.timeout && !page.error && page.dashboard && stableStringify(page.dashboard) === expected) {
+      return true;
+    }
+    if (Date.now() < deadline) {
+      await sleep(VERIFY_APPLY_INTERVAL_MS);
+    }
+  }
+  return false;
 }
 
 // Route handlers
@@ -294,8 +190,8 @@ async function handleStatus(req, res) {
   sendJson(res, {
     status: 'ok',
     version: '2.0.0',
-    pendingEdits: pendingEdits.size,
-    pendingGets: pendingGets.size
+    pendingCommands: broker.pendingCount(),
+    connectedDashboards: broker.listDashboards().length
   });
 }
 
@@ -349,190 +245,13 @@ async function handleDashboardGet(req, res, dashboardIdFromPath) {
   sendJson(res, result);
 }
 
-async function handlePoll(req, res) {
-  const url = new URL(req.url, `http://localhost:${PORT}`);
-  const dashboardId = url.searchParams.get('dashboardId');
-  const instanceId = url.searchParams.get('instanceId') || dashboardId;
-
-  if (!dashboardId) {
-    return sendJson(res, { error: 'Missing dashboardId' }, 400);
-  }
-
-  // Pollers re-register their instance on every poll so a daemon restart relearns the
-  // connected tabs without waiting for a fresh /connect.
-  touchInstance(dashboardId, instanceId);
-
-  // Check if there's already a pending command
-  for (const [id, get] of pendingGets) {
-    if (!get.result && (get.dashboardId === '*' || get.dashboardId === dashboardId)) {
-      return sendJson(res, { pendingGet: { id, dashboardId: get.dashboardId } });
-    }
-  }
-
-  for (const [id, edit] of pendingEdits) {
-    if (!edit.result && (edit.dashboardId === '*' || edit.dashboardId === dashboardId)) {
-      return sendJson(res, {
-        pendingEdit: {
-          id,
-          dashboardId: edit.dashboardId,
-          dashboard: edit.dashboard,
-          description: edit.description,
-          skipConfirmation: edit.skipConfirmation,
-          filename: edit.filename,
-          expiresAt: edit.expiresAt
-        }
-      });
-    }
-  }
-
-  for (const [id, action] of pendingActions) {
-    if (!action.result && (action.dashboardId === '*' || action.dashboardId === dashboardId)) {
-      return sendJson(res, {
-        pendingAction: {
-          id,
-          dashboardId: action.dashboardId,
-          type: action.type,
-          params: action.params
-        }
-      });
-    }
-  }
-
-  // No pending commands - hold the connection (long poll)
-  const timeout = setTimeout(() => {
-    // Remove from waiting list
-    const idx = waitingPollers.findIndex(p => p.res === res);
-    if (idx >= 0) waitingPollers.splice(idx, 1);
-    sendJson(res, { pendingEdit: null, pendingGet: null, pendingAction: null });
-  }, POLL_TIMEOUT_MS);
-
-  waitingPollers.push({ res, dashboardId, timeout });
-}
-
-async function handleResult(req, res) {
-  let data;
-  try {
-    data = await parseBody(req);
-  } catch (e) {
-    return sendJson(res, { error: 'Invalid JSON' }, 400);
-  }
-
-  const { editId, getId, result } = data;
-
-  if (!result) {
-    return sendJson(res, { error: 'Missing result' }, 400);
-  }
-
-  if (editId && pendingEdits.has(editId)) {
-    const edit = pendingEdits.get(editId);
-    edit.result = result;
-    edit.resolve(result);
-    return sendJson(res, { ok: true });
-  }
-
-  if (getId && pendingGets.has(getId)) {
-    const get = pendingGets.get(getId);
-    get.result = result;
-    get.resolve(result);
-    return sendJson(res, { ok: true });
-  }
-
-  // Handle action results (getPages, selectPage, etc.)
-  const { actionId } = data;
-  if (actionId && pendingActions.has(actionId)) {
-    const action = pendingActions.get(actionId);
-    action.result = result;
-    action.resolve(result);
-    return sendJson(res, { ok: true });
-  }
-
-  sendJson(res, { error: 'Request not found' }, 404);
-}
-
-async function handleConnect(req, res) {
-  let data;
-  try {
-    data = await parseBody(req);
-  } catch (e) {
-    return sendJson(res, { error: 'Invalid JSON' }, 400);
-  }
-
-  const { dashboardId, title } = data;
-  if (!dashboardId) {
-    return sendJson(res, { error: 'Missing dashboardId' }, 400);
-  }
-
-  // Default instanceId to dashboardId so the legacy extension (no per-tab id) still works.
-  const instanceId = data.instanceId || dashboardId;
-  const isNew = touchInstance(dashboardId, instanceId, title, data.agentVersion);
-  if (isNew) {
-    log(`Extension connected: ${dashboardId} "${title || 'Untitled'}" (instance ${instanceId}, agent ${data.agentVersion || 'unknown'})`);
-  }
-
-  sendJson(res, { ok: true });
-}
-
-async function handleDisconnect(req, res) {
-  let data;
-  try {
-    data = await parseBody(req);
-  } catch (e) {
-    return sendJson(res, { error: 'Invalid JSON' }, 400);
-  }
-
-  const { dashboardId } = data;
-  if (dashboardId && connectedDashboards.has(dashboardId)) {
-    const instanceId = data.instanceId || dashboardId;
-    removeInstance(dashboardId, instanceId);
-    log(`Extension disconnected: ${dashboardId} (instance ${instanceId})`);
-  }
-
-  sendJson(res, { ok: true });
-}
-
 async function handleDashboards(req, res) {
-  const dashboards = [];
-  for (const [dashboardId, instances] of connectedDashboards) {
-    const list = Array.from(instances.values());
-    const first = list[0] || {};
-    dashboards.push({
-      id: dashboardId,
-      title: first.title || 'Untitled',
-      connectedAt: first.connectedAt || null,
-      instanceCount: list.length,
-      agentVersion: first.agentVersion || null
-    });
-  }
-  sendJson(res, { dashboards });
+  sendJson(res, { dashboards: broker.listDashboards() });
 }
 
 async function handlePages(req, res, dashboardIdFromPath) {
   const dashboardId = dashboardIdFromPath || '*';
-
-  const actionId = randomUUID();
-  const action = {
-    id: actionId,
-    dashboardId,
-    type: 'getPages',
-    params: {},
-    createdAt: Date.now(),
-    result: null,
-    resolve: null
-  };
-
-  const resultPromise = new Promise((resolve) => {
-    action.resolve = resolve;
-  });
-
-  pendingActions.set(actionId, action);
-  notifyPollers();
-
-  const timeoutPromise = new Promise((resolve) =>
-    setTimeout(() => resolve({ timeout: true }), ACTION_TIMEOUT_MS)
-  );
-
-  const result = await Promise.race([resultPromise, timeoutPromise]);
-  pendingActions.delete(actionId);
+  const result = await requestActionFromPage(dashboardId, 'getPages');
 
   if (result.timeout) {
     return sendJson(res, { error: 'Timeout waiting for pages' }, 504);
@@ -543,31 +262,7 @@ async function handlePages(req, res, dashboardIdFromPath) {
 
 async function handleRefresh(req, res, dashboardIdFromPath) {
   const dashboardId = dashboardIdFromPath || '*';
-
-  const actionId = randomUUID();
-  const action = {
-    id: actionId,
-    dashboardId,
-    type: 'refresh',
-    params: {},
-    createdAt: Date.now(),
-    result: null,
-    resolve: null
-  };
-
-  const resultPromise = new Promise((resolve) => {
-    action.resolve = resolve;
-  });
-
-  pendingActions.set(actionId, action);
-  notifyPollers();
-
-  const timeoutPromise = new Promise((resolve) =>
-    setTimeout(() => resolve({ timeout: true }), ACTION_TIMEOUT_MS)
-  );
-
-  const result = await Promise.race([resultPromise, timeoutPromise]);
-  pendingActions.delete(actionId);
+  const result = await requestActionFromPage(dashboardId, 'refresh');
 
   if (result.timeout) {
     return sendJson(res, { error: 'Timeout waiting for refresh' }, 504);
@@ -579,31 +274,7 @@ async function handleRefresh(req, res, dashboardIdFromPath) {
 
 async function handleErrors(req, res, dashboardIdFromPath) {
   const dashboardId = dashboardIdFromPath || '*';
-
-  const actionId = randomUUID();
-  const action = {
-    id: actionId,
-    dashboardId,
-    type: 'getErrors',
-    params: {},
-    createdAt: Date.now(),
-    result: null,
-    resolve: null
-  };
-
-  const resultPromise = new Promise((resolve) => {
-    action.resolve = resolve;
-  });
-
-  pendingActions.set(actionId, action);
-  notifyPollers();
-
-  const timeoutPromise = new Promise((resolve) =>
-    setTimeout(() => resolve({ timeout: true }), ACTION_TIMEOUT_MS)
-  );
-
-  const result = await Promise.race([resultPromise, timeoutPromise]);
-  pendingActions.delete(actionId);
+  const result = await requestActionFromPage(dashboardId, 'getErrors');
 
   if (result.timeout) {
     return sendJson(res, { error: 'Timeout waiting for errors' }, 504);
@@ -630,31 +301,8 @@ async function handleSelectPage(req, res, dashboardIdFromPath) {
     return sendJson(res, { error: 'Missing pageId or pageName' }, 400);
   }
 
-  const actionId = randomUUID();
-  const action = {
-    id: actionId,
-    dashboardId,
-    type: 'selectPage',
-    params: { pageIdOrName },
-    createdAt: Date.now(),
-    result: null,
-    resolve: null
-  };
-
-  const resultPromise = new Promise((resolve) => {
-    action.resolve = resolve;
-  });
-
-  pendingActions.set(actionId, action);
   log(`Select page: ${pageIdOrName} on dashboard ${dashboardId}`);
-  notifyPollers();
-
-  const timeoutPromise = new Promise((resolve) =>
-    setTimeout(() => resolve({ timeout: true }), ACTION_TIMEOUT_MS)
-  );
-
-  const result = await Promise.race([resultPromise, timeoutPromise]);
-  pendingActions.delete(actionId);
+  const result = await requestActionFromPage(dashboardId, 'selectPage', { pageIdOrName });
 
   if (result.timeout) {
     return sendJson(res, { error: 'Timeout waiting for page selection' }, 504);
@@ -737,6 +385,42 @@ async function handleStorePatch(req, res, dashboardId, patchFn) {
   sendJson(res, { ok: true, result: outcome.result, warnings: outcome.warnings || [] });
 }
 
+async function handleSetDashboard(req, res, dashboardId) {
+  if (!store.hasWorking(dashboardId)) {
+    return sendJson(res, {
+      error: 'No working copy for this dashboard',
+      code: 'no_working_copy',
+      hint: 'Call pull first to load the dashboard from the open tab.'
+    }, 409);
+  }
+
+  let body;
+  try {
+    body = await parseBody(req);
+  } catch (e) {
+    return sendJson(res, { error: 'Invalid JSON', code: 'invalid_input' }, 400);
+  }
+
+  const dashboard = body.dashboard;
+  if (!dashboard || typeof dashboard !== 'object' || Array.isArray(dashboard)) {
+    return sendJson(res, {
+      error: 'Missing dashboard object',
+      code: 'invalid_input'
+    }, 400);
+  }
+
+  const problem = await validateOrProblem(dashboard);
+  if (problem) return sendJson(res, problem.body, problem.status);
+
+  try {
+    store.writeWorking(dashboardId, dashboard);
+  } catch (e) {
+    return sendJson(res, { error: e.message, code: 'store_write_failed' }, 500);
+  }
+
+  sendJson(res, { ok: true, result: patch.dashboardSummary(dashboard) });
+}
+
 // Pull the live dashboard JSON from the open tab and seed both the saved and working
 // copies from it. This is the entry point before any read/edit can happen.
 async function handlePull(req, res, dashboardId) {
@@ -766,7 +450,7 @@ async function handlePull(req, res, dashboardId) {
   sendJson(res, { ok: true, result: patch.dashboardSummary(result.dashboard) });
 }
 
-// Push the working copy to the page through the approval/long-poll flow, then promote
+// Push the working copy to the page through the approval/WebSocket flow, then promote
 // working -> saved on success. Refuses when more than one tab targets the dashboard.
 async function handleApply(req, res, dashboardId) {
   if (!store.hasWorking(dashboardId)) {
@@ -784,7 +468,7 @@ async function handleApply(req, res, dashboardId) {
     // apply takes no required body; ignore parse errors and use defaults.
   }
 
-  const instances = instancesFor(dashboardId);
+  const instances = broker.instancesFor(dashboardId);
   if (instances.length > 1) {
     return sendJson(res, {
       error: 'More than one tab is open for this dashboard; refusing to apply',
@@ -810,6 +494,23 @@ async function handleApply(req, res, dashboardId) {
   });
 
   if (result.timeout) {
+    const verified = await verifyAppliedAgainstPage(dashboardId, dash);
+    if (verified) {
+      log(`Apply timed out but live state matches working copy; treating as applied (dashboard ${dashboardId})`);
+      try {
+        store.promoteWorkingToSaved(dashboardId);
+      } catch (e) {
+        return sendJson(res, { error: e.message, code: 'store_write_failed' }, 500);
+      }
+      return sendJson(res, {
+        ok: true,
+        result: {
+          success: true,
+          verified: true,
+          note: 'The apply command timed out before the page reported back, but the live dashboard matches the working copy, so the change committed.'
+        }
+      });
+    }
     return sendJson(res, {
       error: 'Timeout waiting for the extension to apply the edit',
       code: 'page_timeout',
@@ -902,10 +603,6 @@ const router = createRouter();
 router.get('/status', handleStatus);
 router.get('/dashboards', handleDashboards);
 router.get('/schema', handleSchema);
-router.post('/connect', handleConnect);
-router.post('/disconnect', handleDisconnect);
-router.get('/poll', handlePoll);
-router.post('/result', handleResult);
 
 // Live page operations: proxied to the open dashboard tab via the extension bridge.
 router.get('/dashboards/:id', (req, res, { params }) => handleDashboardGet(req, res, params.id));
@@ -919,9 +616,11 @@ router.get('/dashboards/:id/errors', (req, res, { params }) => handleErrors(req,
 router.post('/dashboards/:id/pull', (req, res, { params }) => handlePull(req, res, params.id));
 router.post('/dashboards/:id/apply', (req, res, { params }) => handleApply(req, res, params.id));
 router.post('/dashboards/:id/discard', (req, res, { params }) => handleDiscard(req, res, params.id));
+router.post('/dashboards/:id/set-dashboard', (req, res, { params }) => handleSetDashboard(req, res, params.id));
 
 // Typed read views over the working copy (never the raw normalized JSON).
 router.get('/dashboards/:id/summary', (req, res, { params }) => handleStoreRead(req, res, params.id, (d) => patch.dashboardSummary(d)));
+router.get('/dashboards/:id/dashboard-json', (req, res, { params }) => handleStoreRead(req, res, params.id, (d) => d));
 router.get('/dashboards/:id/page-list', (req, res, { params }) => handleStoreRead(req, res, params.id, (d) => patch.listPages(d)));
 router.get('/dashboards/:id/parameters', (req, res, { params }) => handleStoreRead(req, res, params.id, (d) => patch.getParameters(d)));
 router.get('/dashboards/:id/tiles', (req, res, { params, url }) => handleStoreRead(req, res, params.id, (d) => patch.listTiles(d, url.searchParams.get('pageId'))));
@@ -967,6 +666,30 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
+const wss = new WebSocketServer({ noServer: true });
+wss.on('connection', (ws) => {
+  broker.addSocket(ws);
+});
+
+server.on('upgrade', (req, socket, head) => {
+  const url = new URL(req.url, `http://localhost:${PORT}`);
+  if (url.pathname !== EXTENSION_WS_PATH) {
+    socket.destroy();
+    return;
+  }
+
+  if (req.headers.origin !== EXTENSION_ORIGIN) {
+    socket.destroy();
+    return;
+  }
+
+  wss.handleUpgrade(req, socket, head, (ws) => {
+    wss.emit('connection', ws, req);
+  });
+});
+
+broker.startHeartbeat();
+
 server.listen(PORT, '127.0.0.1', () => {
   console.log(`
 ╔═══════════════════════════════════════════════════════════════════╗
@@ -984,8 +707,7 @@ server.listen(PORT, '127.0.0.1', () => {
 ║    GET  /dashboards/:id/errors   - Get tile errors                ║
 ║                                                                   ║
 ║  Extension:                                                       ║
-║    GET  /poll                    - Long-poll for commands         ║
-║    POST /result                  - Report result                  ║
+║    WS   /extension               - Command bridge                 ║
 ║    GET  /status                  - Health check                   ║
 ╚═══════════════════════════════════════════════════════════════════╝
 `);

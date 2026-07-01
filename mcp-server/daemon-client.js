@@ -188,8 +188,8 @@ export const daemon = {
 
   // Lifecycle.
   pull: (id) => call('POST', `/dashboards/${enc(id)}/pull`, {}, { context: 'Pull dashboard' }),
-  // Apply blocks on the daemon's long-poll for user approval (EDIT_TIMEOUT_MS
-  // is 120s server-side), so give the client a little headroom above that.
+  // Apply blocks on the daemon's browser command bridge for user approval
+  // (EDIT_TIMEOUT_MS is 120s server-side), so give the client a little headroom above that.
   // skipConfirmation auto-clicks ADX's per-apply "Continue" dialog so the edit
   // actually commits; the one-time "Allow Edits" consent is the human gate.
   apply: (id, { skipConfirmation = true } = {}) =>
@@ -200,6 +200,7 @@ export const daemon = {
 
   // Typed read views over the working copy.
   summary: (id) => call('GET', `/dashboards/${enc(id)}/summary`, undefined, { context: 'Get summary' }),
+  getDashboardJson: (id) => call('GET', `/dashboards/${enc(id)}/dashboard-json`, undefined, { context: 'Get dashboard JSON' }),
   listPages: (id) => call('GET', `/dashboards/${enc(id)}/page-list`, undefined, { context: 'List pages' }),
   getParameters: (id) => call('GET', `/dashboards/${enc(id)}/parameters`, undefined, { context: 'Get parameters' }),
   listTiles: (id, pageId) => {
@@ -211,4 +212,6 @@ export const daemon = {
 
   // Typed element writes against the working copy.
   patch: (id, route, body) => call('POST', `/dashboards/${enc(id)}/${route}`, body, { context: route }),
+  setDashboardJson: (id, dashboard) =>
+    call('POST', `/dashboards/${enc(id)}/set-dashboard`, { dashboard }, { context: 'Set dashboard JSON' }),
 };

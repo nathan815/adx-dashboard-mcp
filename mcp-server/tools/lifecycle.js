@@ -24,7 +24,7 @@ export function registerLifecycleTools(server) {
       },
     },
     handler(async ({ dashboardId, autoConfirm = true }, extra) => {
-      // While the daemon long-polls for the user's approval, emit MCP progress
+      // While the daemon waits for the browser-side approval flow, emit MCP progress
       // notifications so the client shows a live pending state instead of an
       // opaque hang. Only fire when the caller supplied a progress token.
       const token = extra && extra._meta && extra._meta.progressToken;

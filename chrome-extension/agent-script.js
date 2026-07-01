@@ -9,7 +9,9 @@
   const authorizedDashboards = new Set();
   const pendingAuthDashboards = new Set();
   const handledEditIds = new Set();
-  let polling = false;
+  let agentSocket = null;
+  let reconnectTimer = null;
+  let reconnectDelayMs = 500;
 
   // Persisted authorization survives page reloads so the user is not re-prompted
   // on every refresh. It is time-boxed: a grant expires after this window and the
@@ -420,67 +422,67 @@
     }
   };
 
-  // Long polling for agent commands
-  async function pollAgentServer() {
-    if (polling) return;  // Prevent concurrent polls
-    polling = true;
-    
-    const dashboardId = getCurrentDashboardId();
-    if (!dashboardId) {
-      polling = false;
-      setTimeout(pollAgentServer, 1000);  // Retry when dashboard loads
+  function scheduleReconnect() {
+    if (reconnectTimer || !currentDashboardId) return;
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
+      connectToServer();
+    }, reconnectDelayMs);
+    reconnectDelayMs = Math.min(reconnectDelayMs * 2, 5000);
+  }
+
+  function closeAgentSocket({ reconnect = false } = {}) {
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+    const socket = agentSocket;
+    agentSocket = null;
+    if (socket && socket.readyState !== WebSocket.CLOSED && socket.readyState !== WebSocket.CLOSING) {
+      socket.close();
+    }
+    if (reconnect) scheduleReconnect();
+  }
+
+  function sendSocketMessage(message) {
+    if (!agentSocket || agentSocket.readyState !== WebSocket.OPEN) {
+      throw new Error('Agent WebSocket is not connected');
+    }
+    agentSocket.send(JSON.stringify(message));
+  }
+
+  async function handleCommand(command) {
+    if (!command.id || handledEditIds.has(command.id)) return;
+    handledEditIds.add(command.id);
+
+    const payload = command.payload || {};
+    if (command.kind === 'getDashboard') {
+      await handlePendingGet({ id: command.id, dashboardId: command.dashboardId });
+      return;
+    }
+    if (command.kind === 'action') {
+      await handlePendingAction({ id: command.id, dashboardId: command.dashboardId, type: payload.type, params: payload.params || {} });
+      return;
+    }
+    if (command.kind === 'edit') {
+      await handlePendingEdit({
+        id: command.id,
+        dashboardId: command.dashboardId,
+        dashboard: payload.dashboard,
+        description: payload.description,
+        skipConfirmation: payload.skipConfirmation,
+        filename: payload.filename,
+        expiresAt: payload.expiresAt || command.expiresAt
+      });
       return;
     }
 
-    // Create abort controller for this poll
-    pollAbortController = new AbortController();
-
-    try {
-      const response = await fetch(
-        `http://localhost:${AGENT_SERVER_PORT}/poll?dashboardId=${dashboardId}&instanceId=${INSTANCE_ID}`,
-        { signal: pollAbortController.signal }
-      );
-      polling = false;
-      
-      if (!response.ok) {
-        setTimeout(pollAgentServer, 1000);
-        return;
-      }
-
-      const data = await response.json();
-      
-      // Handle get requests (no auth needed - read only)
-      if (data.pendingGet && !handledEditIds.has(data.pendingGet.id)) {
-        handledEditIds.add(data.pendingGet.id);
-        await handlePendingGet(data.pendingGet);
-      }
-      
-      // Handle actions (getPages, selectPage, etc.)
-      if (data.pendingAction && !handledEditIds.has(data.pendingAction.id)) {
-        handledEditIds.add(data.pendingAction.id);
-        await handlePendingAction(data.pendingAction);
-      }
-      
-      // Handle edit requests
-      if (data.pendingEdit && !handledEditIds.has(data.pendingEdit.id)) {
-        handledEditIds.add(data.pendingEdit.id);
-        await handlePendingEdit(data.pendingEdit);
-      }
-      
-      // Immediately poll again (long polling returns quickly when there's a command)
-      pollAgentServer();
-    } catch (e) {
-      polling = false;
-      // Ignore abort errors (expected during navigation)
-      if (e.name === 'AbortError') return;
-      // Server not available, retry after delay
-      setTimeout(pollAgentServer, 2000);
-    }
+    sendCommandResult(command.id, { success: false, error: `Unknown command kind: ${command.kind}` });
   }
 
   async function handlePendingGet(getReq) {
     const result = window.__adxAgent.getDashboard();
-    await sendGetResult(getReq.id, result);
+    sendCommandResult(getReq.id, result);
   }
 
   async function handlePendingAction(action) {
@@ -508,7 +510,7 @@
       result = { error: e.message };
     }
 
-    await sendActionResult(actionId, result);
+    sendCommandResult(actionId, result);
   }
 
   async function handlePendingEdit(edit) {
@@ -516,7 +518,7 @@
     const editId = edit.id;
 
     if (!dashboardId) {
-      await sendEditResult(editId, { success: false, error: 'No dashboard is currently open in this tab' });
+      sendCommandResult(editId, { success: false, error: 'No dashboard is currently open in this tab' });
       return;
     }
 
@@ -524,7 +526,7 @@
     // Prompting (and persisting a grant) for a mismatched or expired edit would
     // bless the wrong dashboard or mutate it after the agent already gave up.
     if (edit.dashboardId && edit.dashboardId !== '*' && edit.dashboardId !== dashboardId) {
-      await sendEditResult(editId, {
+      sendCommandResult(editId, {
         success: false,
         error: `Dashboard ID mismatch: edit is for ${edit.dashboardId}, current is ${dashboardId}`
       });
@@ -535,7 +537,7 @@
     // to the agent. If we applied a stale edit now, the dashboard would change
     // silently after the agent already moved on.
     if (edit.expiresAt && Date.now() > edit.expiresAt) {
-      await sendEditResult(editId, {
+      sendCommandResult(editId, {
         success: false,
         error: 'Edit expired before it could be applied (the daemon already timed out). Re-run the edit.'
       });
@@ -555,7 +557,7 @@
           onDeny: () => { pendingAuthDashboards.delete(dashboardId); clearAuthorization(dashboardId); }
         });
       }
-      await sendEditResult(editId, {
+      sendCommandResult(editId, {
         success: false,
         pendingAuthorization: true,
         error: "Authorization required: an approval dialog is open in the ADX browser tab. Click 'Allow Edits' to grant this agent permission for this dashboard, then re-run the edit."
@@ -568,9 +570,9 @@
         skipConfirmation: edit.skipConfirmation || false,
         filename: edit.filename || 'agent-edit.json'
       });
-      await sendEditResult(editId, result);
+      sendCommandResult(editId, result);
     } catch (e) {
-      await sendEditResult(editId, { success: false, error: e.message });
+      sendCommandResult(editId, { success: false, error: e.message });
     }
   }
 
@@ -632,39 +634,11 @@
     });
   }
 
-  async function sendEditResult(editId, result) {
+  function sendCommandResult(commandId, result) {
     try {
-      await fetch(`http://localhost:${AGENT_SERVER_PORT}/result`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ editId, result })
-      });
+      sendSocketMessage({ type: 'result', id: commandId, result });
     } catch (e) {
-      console.error('[ADX Agent] Failed to send result:', e);
-    }
-  }
-
-  async function sendGetResult(getId, result) {
-    try {
-      await fetch(`http://localhost:${AGENT_SERVER_PORT}/result`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ getId, result })
-      });
-    } catch (e) {
-      console.error('[ADX Agent] Failed to send get result:', e);
-    }
-  }
-
-  async function sendActionResult(actionId, result) {
-    try {
-      await fetch(`http://localhost:${AGENT_SERVER_PORT}/result`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ actionId, result })
-      });
-    } catch (e) {
-      console.error('[ADX Agent] Failed to send action result:', e);
+      console.error('[ADX Agent] Failed to send command result:', e);
     }
   }
 
@@ -678,26 +652,78 @@
       return false;  // Will retry in start()
     }
 
-    try {
-      await fetch(`http://localhost:${AGENT_SERVER_PORT}/connect`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ dashboardId, title: dashData.title, instanceId: INSTANCE_ID, agentVersion: window.__adxAgent.version })
+    closeAgentSocket();
+
+    return new Promise((resolve) => {
+      const socket = new WebSocket(`ws://127.0.0.1:${AGENT_SERVER_PORT}/extension`);
+      let settled = false;
+      agentSocket = socket;
+
+      const settle = (value) => {
+        if (settled) return;
+        settled = true;
+        resolve(value);
+      };
+
+      socket.addEventListener('open', () => {
+        reconnectDelayMs = 500;
+        try {
+          sendSocketMessage({
+            type: 'register',
+            dashboardId,
+            title: dashData.title,
+            instanceId: INSTANCE_ID,
+            agentVersion: window.__adxAgent.version
+          });
+          settle(true);
+        } catch (e) {
+          console.error('[ADX Agent] Failed to register WebSocket:', e);
+          settle(false);
+        }
       });
-      return true;
-    } catch (e) {
-      return false;
-    }
+
+      socket.addEventListener('message', async (event) => {
+        let message;
+        try {
+          message = JSON.parse(event.data);
+        } catch (e) {
+          console.error('[ADX Agent] Invalid WebSocket message:', e);
+          return;
+        }
+
+        if (message.type === 'command') {
+          await handleCommand(message);
+          return;
+        }
+        if (message.type === 'ping') {
+          try {
+            sendSocketMessage({ type: 'pong', at: Date.now() });
+          } catch (e) {
+            console.error('[ADX Agent] Failed to send heartbeat response:', e);
+          }
+          return;
+        }
+        if (message.type === 'error') {
+          console.error('[ADX Agent] Daemon WebSocket error:', message);
+        }
+      });
+
+      socket.addEventListener('close', () => {
+        if (agentSocket === socket) {
+          agentSocket = null;
+          scheduleReconnect();
+        }
+        settle(false);
+      });
+
+      socket.addEventListener('error', () => {
+        settle(false);
+      });
+    });
   }
 
   function disconnectFromServer() {
-    if (!currentDashboardId) return;
-
-    // Use sendBeacon for reliable delivery during page unload
-    navigator.sendBeacon(
-      `http://localhost:${AGENT_SERVER_PORT}/disconnect`,
-      JSON.stringify({ dashboardId: currentDashboardId, instanceId: INSTANCE_ID })
-    );
+    closeAgentSocket();
   }
 
   // Disconnect when page unloads
@@ -705,7 +731,6 @@
 
   // Track current dashboard for SPA navigation
   let currentDashboardId = null;
-  let pollAbortController = null;
 
   async function handleDashboardChange() {
     const newDashboardId = getCurrentDashboardId();
@@ -715,15 +740,7 @@
     
     // Disconnect from old dashboard
     if (currentDashboardId) {
-      navigator.sendBeacon(
-        `http://localhost:${AGENT_SERVER_PORT}/disconnect`,
-        JSON.stringify({ dashboardId: currentDashboardId, instanceId: INSTANCE_ID })
-      );
-      // Abort any pending poll
-      if (pollAbortController) {
-        pollAbortController.abort();
-        pollAbortController = null;
-      }
+      closeAgentSocket();
     }
     
     currentDashboardId = newDashboardId;
@@ -738,9 +755,7 @@
           return;
         }
         const connected = await connectToServer();
-        if (connected) {
-          pollAgentServer();
-        } else {
+        if (!connected) {
           setTimeout(waitForData, 500);
         }
       };
@@ -764,7 +779,7 @@
   
   window.addEventListener('popstate', handleDashboardChange);
 
-  // Start: connect then poll
+  // Start: connect once dashboard data is available.
   async function start() {
     const dashboardId = getCurrentDashboardId();
     if (!dashboardId) {
@@ -780,8 +795,6 @@
       setTimeout(start, 500);
       return;
     }
-    
-    pollAgentServer();
   }
 
   start();
